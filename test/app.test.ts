@@ -247,9 +247,13 @@ test("the owner turns extensions off and on, the guard follows its switch, and t
 	const module = (file: string) => app.loader.list().find((each) => each.file === file)!;
 	assert.deepEqual(
 		app.loader.list().map((each) => each.file),
-		["prompt.ts", "artifacts.ts", "subagents.ts", "guard.ts", "codemode.ts"],
+		["prompt.ts", "workflows.ts", "artifacts.ts", "subagents.ts", "guard.ts", "codemode.ts"],
 	);
 	assert.equal(module("prompt.ts").required, true);
+	assert.equal(module("workflows.ts").required, true);
+	assert.equal(module("workflows.ts").title, "Workflows");
+	assert.match(module("workflows.ts").summary, /^Durable workflow task registration/);
+	assert.ok(app.loader.extensionNames().includes("pocket-workflows"));
 	assert.equal(module("codemode.ts").title, "Codemode");
 	assert.match(module("codemode.ts").summary, /^Codemode lets the agent write JavaScript that calls its other tools/);
 	assert.deepEqual(module("codemode.ts").extensions[0]?.tools, ["codemode"]);
@@ -275,6 +279,7 @@ test("the owner turns extensions off and on, the guard follows its switch, and t
 	assert.match(guard.detail, /off in Pi Pocket/);
 
 	await assert.rejects(app.setExtensionEnabled(owner(), "prompt.ts", false), /required/);
+	await assert.rejects(app.setExtensionEnabled(owner(), "workflows.ts", false), /required/);
 	await assert.rejects(app.setExtensionEnabled(owner(), "nope.ts", false), /no extension module/);
 
 	await app.close();
@@ -312,7 +317,7 @@ test("anyone signed in can list extensions; only the owner can change them", asy
 	try {
 		const listed = await call(guest.token, "extensions");
 		assert.equal(listed.status, 200);
-		assert.equal(((await listed.json()) as { modules: unknown[] }).modules.length, 5);
+		assert.equal(((await listed.json()) as { modules: unknown[] }).modules.length, 6);
 		assert.equal((await call(guest.token, "extensions/guard.ts", { enabled: false })).status, 403);
 		assert.equal((await call(guest.token, "extensions/guard.ts/reload", {})).status, 403);
 		assert.equal((await call(app.config.ownerToken, "extensions/guard.ts", { enabled: "no" })).status, 400);

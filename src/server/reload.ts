@@ -13,13 +13,14 @@ import type { Extension, Registry } from "@earendil-works/pi-durable";
 import type { ExtensionModule, PocketHost } from "./host.ts";
 
 /** Built-in extension modules, in install order. Other `.ts` files in the directory load after them, by name. */
-const ORDER = ["prompt.ts", "artifacts.ts", "subagents.ts", "guard.ts", "codemode.ts"];
+const ORDER = ["prompt.ts", "workflows.ts", "artifacts.ts", "subagents.ts", "guard.ts", "codemode.ts"];
 /** Modules the app cannot work without: always on. */
-const REQUIRED = new Set(["prompt.ts"]);
+const REQUIRED = new Set(["prompt.ts", "workflows.ts"]);
 /** Modules that stay off until the owner turns them on. */
 const OFF_BY_DEFAULT = new Set(["guard.ts"]);
 const TITLES: Record<string, string> = {
 	"prompt.ts": "System prompt",
+	"workflows.ts": "Workflows",
 	"artifacts.ts": "Artifacts",
 	"subagents.ts": "Subagents",
 	"guard.ts": "Lancet Guard",

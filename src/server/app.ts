@@ -40,6 +40,7 @@ import {
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
+import { WorkflowEngine } from "../../packages/workflow-runtime/index.ts";
 import { APP_ROOT, ConfigStore, type User } from "./config.ts";
 import {
 	ArtifactBodyDoc,
@@ -69,6 +70,26 @@ import { type ClientEntry, plainText, projectEntry, projectLive, projectStats } 
 import { type ExtensionInfo, ExtensionLoader } from "./reload.ts";
 
 const context = BACKGROUND_CONTEXT;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function scheduleWorkflowTimer(at: number, callback: () => void): () => void {
+	let timer: NodeJS.Timeout | undefined;
+	let cancelled = false;
+	const arm = () => {
+		if (cancelled) return;
+		const delay = Math.max(0, at - Date.now());
+		timer = setTimeout(() => {
+			if (cancelled) return;
+			if (Date.now() >= at) callback();
+			else arm();
+		}, Math.min(delay, MAX_TIMER_DELAY_MS));
+	};
+	arm();
+	return () => {
+		cancelled = true;
+		if (timer !== undefined) clearTimeout(timer);
+	};
+}
 
 export class HttpError extends Error {
 	readonly status: number;
@@ -488,6 +509,8 @@ export class PocketApp {
 	/** Set by the launcher over IPC; undefined when the server runs on its own. */
 	access: AccessInfo | undefined;
 	harness!: Harness;
+	/** One workflow engine and timer subscription share this app's Harness lifetime. */
+	workflowEngine: WorkflowEngine | undefined;
 	models!: ModelRuntime;
 	settings!: SettingsManager;
 	loader!: ExtensionLoader;
@@ -702,8 +725,19 @@ export class PocketApp {
 		});
 
 		if (this.loader.enabled(GUARD_FILE)) void this.guard.warm().catch(() => {});
-		// Work a previous process left unfinished continues now.
-		this.harness.resume();
+		// Open timers before resuming persisted tasks; extension reloads never own these resources.
+		const workflowEngine = new WorkflowEngine(this.harness, {
+			scheduleAt: scheduleWorkflowTimer,
+			onTimerError: (error: unknown) => this.#log(`workflow timer wake failed: ${describe(error)}`),
+		});
+		this.workflowEngine = workflowEngine;
+		try {
+			await workflowEngine.open(context);
+		} catch (error) {
+			this.workflowEngine = undefined;
+			await workflowEngine.close();
+			throw error;
+		}
 	}
 
 	#harnessSettings(): HarnessSettings {
@@ -2023,8 +2057,12 @@ export class PocketApp {
 			for (const pending of this.#rooms.values()) void pending.then((room) => room.close(), () => {});
 			for (const flow of this.#flows.values()) flow.abort.abort();
 			try {
-				// Close writes no outcome: running work resumes when the next process opens the storage.
-				await this.harness?.close(context);
+				// Stop timer wakes before closing their Harness; workflow state remains resumable.
+				try {
+					await this.workflowEngine?.close();
+				} finally {
+					await this.harness?.close(context);
+				}
 				for (const env of this.#envs.values()) await env.cleanup(context);
 			} finally {
 				rmSync(this.#lockFile, { force: true });
