@@ -1,0 +1,254 @@
+diff --git a/dist/harness/scheduler.js b/dist/harness/scheduler.js
+index 4e2d00f0d3539bb9ada6195d0979fda171f14ad0..2eeb4e93cf6e2ffc771ccb8c960a2d6847af7c8e 100644
+--- a/dist/harness/scheduler.js
++++ b/dist/harness/scheduler.js
+@@ -594,11 +594,15 @@ export class TaskScheduler {
+                 // Taken once per pass, and only when some task is a candidate.
+                 let snapshot;
+                 for (const record of [...this.#live.values()]) {
+-                    if (this.#invocations.has(record.id) || this.#waitingOn(record, owned).length > 0)
++                    if (this.#invocations.has(record.id) ||
++                        this.#waitingOn(record, owned).length > 0 ||
++                        this.#waitingForExternalWake(record))
+                         continue;
+                     if (record.state.status === "completing")
+                         continue;
+-                    const runnable = record;
++                    const runnable = record.state.status === "waiting" && record.state.external === true && record.wakePending === true
++                        ? { ...record, wakePending: false }
++                        : record;
+                     const mode = record.abortRequested ? "abort" : "run";
+                     snapshot ??= this.#registry.snapshot();
+                     const resolution = this.#resolve(runnable, snapshot);
+@@ -640,6 +644,13 @@ export class TaskScheduler {
+             return [];
+         return record.state.on.filter((id) => this.#live.has(id));
+     }
++    /** An external wait has no invocation until a wake request is committed; abort marks always take precedence. */
++    #waitingForExternalWake(record) {
++        return (!record.abortRequested &&
++            record.state.status === "waiting" &&
++            record.state.external === true &&
++            record.wakePending !== true);
++    }
+     /** Resolve the record's definition by kind, migrating an older stored version. */
+     #resolve(record, snapshot) {
+         const fit = this.#fit(record, snapshot.task(record.kind));
+@@ -696,8 +707,13 @@ export class TaskScheduler {
+         if (record.state.status === "completing")
+             return { kind: "completing" };
+         const on = this.#waitingOn(record, owned);
+-        if (on.length > 0)
+-            return { kind: "waiting", on };
++        if (on.length > 0 || this.#waitingForExternalWake(record)) {
++            return {
++                kind: "waiting",
++                on,
++                ...(record.state.status === "waiting" && record.state.external === true ? { external: true } : {}),
++            };
++        }
+         const fit = this.#fit(record, snapshot.task(record.kind));
+         if ("reason" in fit)
+             return { kind: "blocked", ...fit };
+@@ -1135,11 +1151,11 @@ function erased(task) {
+ function endedError(invocation) {
+     return new Error(`Task ${invocation.taskId} invocation has ended`);
+ }
+-/** Replace a live record's state; memos disappear once an outcome is decided. */
++/** Replace a live record's state; memos and wake idempotency keys disappear once an outcome is decided. */
+ function withState(record, state) {
+     if (state.status !== "terminal" && state.status !== "completing")
+         return { ...record, state };
+-    const { memos: _memos, ...rest } = record;
++    const { memos: _memos, wakeRequests: _wakeRequests, wakePending: _wakePending, ...rest } = record;
+     return { ...rest, state };
+ }
+ /** Whether a definition can take the task at reservation: same version, or newer with a migration. */
+diff --git a/dist/harness/task-graph.d.ts b/dist/harness/task-graph.d.ts
+index 28709aea7954d7a34faad416a44795e354857f18..a6c77f957d88a1030e9c137bf2367bcf31093167 100644
+--- a/dist/harness/task-graph.d.ts
++++ b/dist/harness/task-graph.d.ts
+@@ -10,6 +10,7 @@ export type TaskGraphState = {
+     readonly phase: string;
+     readonly on: readonly TaskId[];
+     readonly policy: JoinPolicy;
++    readonly external?: true;
+ }
+ /** Outcome held until its ordinary owned work drains. */
+  | {
+diff --git a/dist/harness/task-graph.js b/dist/harness/task-graph.js
+index bd8dcc42b3efdb345c42970f681bbc26a9cd04c2..6734fcdbdc064f6b60b5502ac0827c680f2e09d1 100644
+--- a/dist/harness/task-graph.js
++++ b/dist/harness/task-graph.js
+@@ -150,7 +150,13 @@ function stateOf(record) {
+         case "running":
+             return { status: state.status, phase: phaseOf(state.checkpoint) };
+         case "waiting":
+-            return { status: "waiting", phase: phaseOf(state.checkpoint), on: [...state.on], policy: state.policy };
++            return {
++                status: "waiting",
++                phase: phaseOf(state.checkpoint),
++                on: [...state.on],
++                policy: state.policy,
++                ...(state.external === true ? { external: true } : {}),
++            };
+         // Terminal records never reach here: they leave the graph.
+         case "completing":
+         case "terminal":
+diff --git a/dist/harness/types.d.ts b/dist/harness/types.d.ts
+index 90a829b623022eab2a03c82696b9e84a868a2bff..aff1914c6fa1073a937783a669cc2a052ad1420d 100644
+--- a/dist/harness/types.d.ts
++++ b/dist/harness/types.d.ts
+@@ -389,11 +389,12 @@ export type TaskInspection = {
+     }
+     /**
+      * Waits for these live tasks: the live part of its `on`, or, when abort-marked, its live ordinary owned work, which
+-     * must end before its abort handler starts.
++     * must end before its abort handler starts. `external` identifies an additional durable wake requirement.
+      */
+      | {
+         readonly kind: "waiting";
+         readonly on: readonly TaskId[];
++        readonly external?: true;
+     }
+     /** Outcome held until its ordinary owned work drains. */
+      | {
+diff --git a/dist/session/transaction.d.ts b/dist/session/transaction.d.ts
+index 0941f98d47b1ed310e6b506c3ba26477d6dff4d7..f6374f8f6e6213184f9b3f5fbbee19ba7e1fcf79 100644
+--- a/dist/session/transaction.d.ts
++++ b/dist/session/transaction.d.ts
+@@ -71,6 +71,8 @@ export declare class Transaction implements Tx {
+     createTask<I, S extends {
+         phase: string;
+     }, R, H extends object>(task: Task<I, S, R, H>, input: I, options: TaskOptions): Promise<TaskId<R>>;
++    /** Persist one idempotent wake request without changing the task's state or checkpoint. */
++    wakeTask(id: TaskId, requestId: string): Promise<boolean>;
+     /** Create a raw submission record with a fresh ID; no admission rules apply. */
+     createSubmission(create: SubmissionCreate): Promise<SubmissionRecord>;
+     /**
+diff --git a/dist/session/transaction.js b/dist/session/transaction.js
+index 026df30ec4b48db5a4ccf72508954e6aa0b052e1..7b333e3096a221b05235c85901ca6216cb8d4790 100644
+--- a/dist/session/transaction.js
++++ b/dist/session/transaction.js
+@@ -46,6 +46,8 @@ export class Transaction {
+     #forkSourceDocumentIds = new Set();
+     /** One entry per task touched by a public read, candidate write, or document-owner lookup. */
+     #tasksById = new Map();
++    /** Wake requests for one task are admitted in call order so concurrent requests see each other's staged keys. */
++    #wakeTaskQueues = new Map();
+     /** Submissions created by this transaction, by ID. */
+     #submissions = new Map();
+     /** Submission settlements and placements in staging order; resolved against the latest candidate record during assembly. */
+@@ -211,6 +213,32 @@ export class Transaction {
+             return id;
+         });
+     }
++    /** Persist one idempotent wake request without changing the task's state or checkpoint. */
++    wakeTask(id, requestId) {
++        return this.#write(() => {
++            const previous = this.#wakeTaskQueues.get(id) ?? Promise.resolve();
++            const operation = previous.then(async () => {
++                if (requestId.length === 0)
++                    throw new TypeError("Tx.wakeTask() requires a non-empty request ID");
++                const current = await this.#currentTask(id);
++                this.#assertOpen();
++                if (current === undefined)
++                    throw new Error(`Task ${id} does not exist`);
++                if (current.abortRequested ||
++                    current.state.status === "completing" ||
++                    current.state.status === "terminal") {
++                    return false;
++                }
++                const wakeRequests = current.wakeRequests ?? [];
++                if (wakeRequests.includes(requestId))
++                    return false;
++                this.setTask({ ...current, wakeRequests: [...wakeRequests, requestId], wakePending: true });
++                return true;
++            });
++            this.#wakeTaskQueues.set(id, operation.then(() => undefined, () => undefined));
++            return operation;
++        });
++    }
+     /** Create a raw submission record with a fresh ID; no admission rules apply. */
+     createSubmission(create) {
+         return this.#write(async () => {
+diff --git a/dist/storage/jsonl/storage.d.ts b/dist/storage/jsonl/storage.d.ts
+index b8faed005a6f460a23560d7c729f44ed6e8b496e..8ade773c6dfec9102e5f25ec786a8e847571ae91 100644
+--- a/dist/storage/jsonl/storage.d.ts
++++ b/dist/storage/jsonl/storage.d.ts
+@@ -44,6 +44,8 @@ export declare class JsonlStorage implements Storage {
+         readonly owner?: TaskId;
+         readonly background: boolean;
+         readonly abortRequested: boolean;
++        readonly wakeRequests?: readonly string[];
++        readonly wakePending?: boolean;
+     } & ({
+         readonly state: {
+             readonly status: "pending";
+@@ -58,6 +60,7 @@ export declare class JsonlStorage implements Storage {
+             readonly checkpoint: JsonValue;
+             readonly on: readonly TaskId[];
+             readonly policy: import("../../types.ts").JoinPolicy;
++            readonly external?: true;
+             readonly outcome?: never;
+         };
+         readonly memos?: Readonly<Record<string, JsonValue>>;
+@@ -82,6 +85,8 @@ export declare class JsonlStorage implements Storage {
+         readonly owner?: TaskId;
+         readonly background: boolean;
+         readonly abortRequested: boolean;
++        readonly wakeRequests?: readonly string[];
++        readonly wakePending?: boolean;
+     } & ({
+         readonly state: {
+             readonly status: "pending";
+@@ -96,6 +101,7 @@ export declare class JsonlStorage implements Storage {
+             readonly checkpoint: JsonValue;
+             readonly on: readonly TaskId[];
+             readonly policy: import("../../types.ts").JoinPolicy;
++            readonly external?: true;
+             readonly outcome?: never;
+         };
+         readonly memos?: Readonly<Record<string, JsonValue>>;
+diff --git a/dist/types.d.ts b/dist/types.d.ts
+index 19096c02e4586347078f08433176ed839bb11a5e..422bcb86760964be6d57d8fe6ebe82581cd55c8f 100644
+--- a/dist/types.d.ts
++++ b/dist/types.d.ts
+@@ -435,11 +435,13 @@ export type TaskState<S, R> = {
+     readonly checkpoint: S;
+     readonly outcome?: never;
+ } | {
+-    /** Parked without an invocation until every task in `on` is terminal; then resumes at `checkpoint`. */
++    /** Parked without an invocation until its task dependencies or an external wake are ready. */
+     readonly status: "waiting";
+     readonly checkpoint: S;
+     readonly on: readonly TaskId[];
+     readonly policy: JoinPolicy;
++    /** Wait for `Tx.wakeTask()` as well as every task in `on`; unlike an empty ordinary wait, does not auto-resume. */
++    readonly external?: true;
+     readonly outcome?: never;
+ } | {
+     /** Outcome decided; becomes terminal once no ordinary owned work below is live. Runs no more code. */
+@@ -468,6 +470,10 @@ type TaskRecordBase<I, R> = {
+     readonly background: boolean;
+     /** Durable abort mark checked before run-mode progress is committed. */
+     readonly abortRequested: boolean;
++    /** Accepted wake idempotency keys while the task is live; removed when its outcome is decided. */
++    readonly wakeRequests?: readonly string[];
++    /** An accepted wake not yet consumed by an external wait. */
++    readonly wakePending?: boolean;
+ };
+ /** Complete replacement record for one durable task state machine. */
+ export type TaskRecord<I, S, R> = TaskRecordBase<I, R> & ({
+@@ -690,6 +696,11 @@ export interface Tx {
+     createTask<I, S extends {
+         phase: string;
+     }, R, H extends object>(task: Task<I, S, R, H>, input: I, options: TaskOptions): Promise<TaskId<R>>;
++    /**
++     * Durably request an external wake. A fresh `requestId` is recorded once per task; retries with the same ID are
++     * no-ops. The request is consumed when an `external: true` wait is next reserved.
++     */
++    wakeTask(id: TaskId, requestId: string): Promise<boolean>;
+     /**
+      * Create a raw submission record with a fresh ID. No admission rules apply: no busy check, no inbox queueing, no
+      * placement. Use `Conversation.submit()` or a conversation handle unless the caller implements admission itself.

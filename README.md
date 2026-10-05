@@ -24,8 +24,8 @@ Requires Node.js 22.19 or newer. Runs on Linux, macOS, Windows, and Android (Ter
 ```bash
 git clone https://github.com/TannerMidd/pi-pocket.git
 cd pi-pocket
-npm install
-npm start
+pnpm install
+pnpm start
 ```
 
 The launcher asks how your devices should connect, then prints the address, a sign-in link, and a QR code. Open the link once per browser; the cookie lasts a year. The link is the owner's key, so keep it private. `--rotate-token` replaces it and signs out every device that used the old link; people you invited stay signed in until you remove them under Menu → People.
@@ -71,7 +71,7 @@ pkg install nodejs git
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 pi                      # /login, then quit
 # copy or clone pi-pocket to the phone, then:
-cd pi-pocket && npm install --ignore-scripts && npm start
+cd pi-pocket && pnpm install --ignore-scripts && pnpm start
 ```
 
 Open the link in Chrome and choose **Add to Home screen**. Run `termux-wake-lock` so Android does not stop Termux.
