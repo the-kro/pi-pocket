@@ -41,7 +41,7 @@ import {
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
-import { WorkflowEngine } from "../../packages/workflow-runtime/index.ts";
+import { pocketWorkflowRuntime, type WorkflowEngine } from "../../packages/workflow-runtime/core/index.ts";
 import { APP_ROOT, ConfigStore, type User } from "./config.ts";
 import {
 	ArtifactBodyDoc,
@@ -512,7 +512,7 @@ export class PocketApp {
 	/** Set by the launcher over IPC; undefined when the server runs on its own. */
 	access: AccessInfo | undefined;
 	harness!: Harness;
-	/** Pocket's served interpreter and timer subscription share this app's Harness lifetime. */
+	/** Pocket's canonical production workflow engine shares this app's Harness lifetime. */
 	workflowEngine: WorkflowEngine | undefined;
 	models!: ModelRuntime;
 	settings!: SettingsManager;
@@ -730,7 +730,7 @@ export class PocketApp {
 
 		if (this.loader.enabled(GUARD_FILE)) void this.guard.warm().catch(() => {});
 		// Open timers before resuming persisted tasks; extension reloads never own these resources.
-		const workflowEngine = new WorkflowEngine(this.harness, {
+		const workflowEngine = pocketWorkflowRuntime.createEngine(this.harness, {
 			scheduleAt: scheduleWorkflowTimer,
 			onTimerError: (error: unknown) => this.#log(`workflow timer wake failed: ${describe(error)}`),
 		});

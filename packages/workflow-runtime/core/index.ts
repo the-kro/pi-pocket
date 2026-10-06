@@ -15,6 +15,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { canonicalInput, freezeJson, idempotencyKey } from "./identity.ts";
 import { observeStopCall, RunControl, StopFailures } from "./run-control.ts";
+import { WorkflowTimerHost, type WorkflowTimerOptions } from "../timer-host.ts";
 
 export type WorkflowErrorRecord = {
 	readonly name: string;
@@ -40,7 +41,11 @@ export type StepDoOptions<T extends JsonValue> = {
 		execution: StepExecution,
 	) => RecoveryResult<T> | Promise<RecoveryResult<T>>;
 };
+export type Duration = number | string;
 export type WorkflowStep = {
+	sleep(waitId: string, duration: Duration): Promise<void>;
+	sleepUntil(waitId: string, at: number | Date): Promise<void>;
+	waitForEvent<T extends JsonValue>(waitId: string, type: string, options?: { timeout?: Duration }): Promise<{ readonly eventId: string; readonly payload: T }>;
 	do<T extends JsonValue>(
 		operationId: string,
 		callback: (execution: StepExecution) => T | Promise<T>,
@@ -70,6 +75,7 @@ export type WorkflowInspection = {
 	readonly workflowVersion: number;
 	readonly status:
 		| "running"
+		| "waiting"
 		| "completed"
 		| "failed"
 		| "stopped"
@@ -85,6 +91,7 @@ export type WorkflowInspection = {
 		>
 	>;
 	readonly operationsTruncated: number;
+	readonly current?: { readonly waitId?: string; readonly kind?: string; readonly eventType?: string; readonly dueAt?: number };
 	/** Native Task selection may precede descendant cleanup. Inspect native descendants for failures. */
 	readonly cleanup?: {
 		readonly status: "pending" | "native-settled";
@@ -114,6 +121,8 @@ export type WorkflowRunRecord = {
 	operations: Record<string, OperationProjection>;
 	operationOrder: string[];
 	operationsTruncated?: number;
+	currentWait?: WorkflowWait;
+	events?: WorkflowMailboxEvent[];
 	selectedOutcome?: WorkflowOutcome;
 	stopCommand?: { readonly reason: string; readonly request: number };
 	cleanup?: { readonly status: "pending" };
@@ -144,9 +153,28 @@ type OperationCheckpoint = {
 	result?: JsonValue;
 	error?: WorkflowErrorRecord;
 };
+export type WorkflowWait = {
+	waitId: string;
+	kind: "sleep" | "event";
+	dueAt?: number;
+	eventType?: string;
+	durationMs?: number;
+	status: "unresolved" | "resolved";
+	outcome?: "event" | "timeout" | "elapsed";
+	eventId?: string;
+	payload?: JsonValue;
+};
+type WorkflowMailboxEvent = {
+	eventId: string;
+	type: string;
+	payload: JsonValue;
+	digest: string;
+	consumedBy?: string;
+};
 export type WorkflowCheckpoint = {
 	phase: "run";
 	operations: Record<string, OperationCheckpoint>;
+	waits?: Record<string, WorkflowWait>;
 	control?: {
 		/** The exact revision already reserved for a native selection attempt. */
 		request: number;
@@ -165,7 +193,8 @@ export type WorkflowRunningTask = RunningTask<
 	WorkflowCheckpoint,
 	JsonValue
 >;
-type WorkflowEvent =
+export type WorkflowEvent = { readonly id: string; readonly type: string; readonly payload: JsonValue };
+type WorkflowJournalEvent =
 	| {
 			readonly type: "workflow.started";
 			readonly runId: string;
@@ -183,6 +212,21 @@ type WorkflowEvent =
 			readonly type: "workflow.stopped";
 			readonly runId: string;
 			readonly reason: string;
+	  }
+	| {
+			readonly type: "event.received" | "event.buffered" | "event.accepted";
+			readonly runId: string;
+			readonly eventId: string;
+			readonly eventType: string;
+			readonly digest: string;
+	  }
+	| {
+			readonly type: "wait.registered" | "wait.resolved" | "wait.timed_out";
+			readonly runId: string;
+			readonly waitId: string;
+			readonly kind: "sleep" | "event";
+			readonly dueAt?: number;
+			readonly eventType?: string;
 	  }
 	| {
 			readonly type:
@@ -220,7 +264,7 @@ export const RUN_DOC = defineDocFamily<WorkflowRunRecord, string>({
 		operationOrder: [],
 	}),
 });
-const JOURNAL = defineEntry<WorkflowEvent>("pocket.workflow-runtime.event");
+const JOURNAL = defineEntry<WorkflowJournalEvent>("pocket.workflow-runtime.event");
 type DefinitionRegistry = Map<string, WorkflowDefinition<JsonValue, JsonValue>>;
 const definitions: DefinitionRegistry = new Map();
 const MAX_ERROR_LENGTH = 1_000;
@@ -243,12 +287,24 @@ export class UnknownOperationError extends Error {
 	}
 }
 
+
+export class WorkflowEventTimeoutError extends Error {
+	readonly waitId: string;
+	constructor(waitId: string) {
+		super(`Workflow event wait ${waitId} timed out`);
+		this.name = "WorkflowEventTimeoutError";
+		this.waitId = waitId;
+	}
+}
+
 export class WorkflowStoppedError extends Error {
 	constructor(runId: string, reason: string) {
 		super(`Workflow ${runId} stopped: ${reason}`);
 		this.name = "WorkflowStoppedError";
 	}
 }
+
+class SuspendWorkflow extends Error {}
 
 export class WorkflowRunError extends Error {
 	readonly workflowName: string;
@@ -313,7 +369,7 @@ function errorFrom(record: WorkflowErrorRecord): Error {
 async function writeEvent(
 	tx: Tx,
 	conversationId: number,
-	event: WorkflowEvent,
+	event: WorkflowJournalEvent,
 ): Promise<void> {
 	await tx.appendEntry(JOURNAL, conversationId as never, { data: event });
 }
@@ -507,14 +563,14 @@ function summarizeOperation(
 
 function operationEvent(
 	type: Extract<
-		WorkflowEvent,
+		WorkflowJournalEvent,
 		{ readonly type: `operation.${string}` }
 	>["type"],
 	runId: string,
 	operationId: string,
 	operation: OperationCheckpoint,
 	resolution?: "completed" | "retry" | "unknown",
-): WorkflowEvent {
+): WorkflowJournalEvent {
 	const latest = operation.attempts.at(-1);
 	if (latest === undefined)
 		throw new Error(`Operation ${operationId} has no attempt`);
@@ -527,7 +583,7 @@ function operationEvent(
 		idempotencyKey: idempotencyKey(runId, operationId),
 		...(latest.error === undefined ? {} : { error: latest.error }),
 		...(resolution === undefined ? {} : { resolution }),
-	} as WorkflowEvent;
+	} as WorkflowJournalEvent;
 }
 
 async function persistOperation(
@@ -536,7 +592,7 @@ async function persistOperation(
 	operation: OperationCheckpoint,
 	runtime: WorkflowRuntime,
 	context: Context,
-	events: readonly WorkflowEvent[],
+	events: readonly WorkflowJournalEvent[],
 ): Promise<void> {
 	await runtime.commit(async (tx, current) => {
 		const run = await tx.doc(RUN_DOC, runId, runId);
@@ -1063,6 +1119,20 @@ async function executeOperation<T extends JsonValue>(
 	}
 }
 
+function durationMilliseconds(duration: Duration): number {
+	if (typeof duration === "number") {
+		if (!Number.isSafeInteger(duration) || duration < 0) throw new TypeError("step.sleep() requires a non-negative integer duration");
+		return duration;
+	}
+	const match = /^(0|[1-9][0-9]*)(ms|s|m|h|d)$/.exec(duration);
+	if (match === null) throw new TypeError("step.sleep() duration must be milliseconds or a value such as 30s, 5m, or 2h");
+	const amount = Number(match[1]);
+	const multiplier = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[match[2] as "ms" | "s" | "m" | "h" | "d"];
+	const result = amount * multiplier;
+	if (!Number.isSafeInteger(result)) throw new TypeError("step.sleep() duration exceeds the safe integer range");
+	return result;
+}
+
 function makeWorkflowStep(
 	task: WorkflowRunningTask,
 	runtime: WorkflowRuntime,
@@ -1071,7 +1141,135 @@ function makeWorkflowStep(
 	signal: AbortSignal,
 ): WorkflowStep {
 	const visited = new Set<string>();
+	const visitedWaits = new Set<string>();
+	const activeEventTypes = new Map<string, string>();
+	const sleepUntil = async (waitId: string, at: number | Date | undefined, relativeDuration?: number): Promise<void> => {
+		if (waitId.length === 0) throw new TypeError("Workflow wait ID must be non-empty");
+		if (visitedWaits.has(waitId)) throw new Error(`Workflow wait ${waitId} was called more than once in one invocation`);
+		visitedWaits.add(waitId);
+		const requestedAt = at instanceof Date ? at.getTime() : at;
+		if (relativeDuration === undefined && requestedAt === undefined) throw new TypeError("step.sleepUntil() requires an integer deadline");
+		let dueAt: number = relativeDuration === undefined ? requestedAt! : Date.now() + relativeDuration;
+		if (!Number.isSafeInteger(dueAt)) throw new TypeError("step.sleepUntil() requires an integer deadline");
+		let shouldSuspend = false;
+		await runtime.commit(async (tx, current) => {
+			const run = await tx.doc(RUN_DOC, task.input.runId, task.input.runId);
+			const checkpoint = current.state.checkpoint;
+			if (run.selectedOutcome !== undefined || run.stopCommand !== undefined) return { status: "running" as const, checkpoint };
+			const waits = checkpoint.waits ?? {};
+			const prior = waits[waitId];
+			if (prior !== undefined) {
+				if (prior.kind !== "sleep" || (relativeDuration === undefined ? prior.durationMs !== undefined || prior.dueAt !== dueAt : prior.durationMs !== relativeDuration)) {
+					throw new Error(`Workflow sleep ${waitId} changed kind, mode, duration, or absolute deadline`);
+				}
+				dueAt = prior.dueAt!;
+			}
+			if (prior?.status === "resolved") {
+				run.currentWait = prior;
+				return { status: "running" as const, checkpoint };
+			}
+			if (prior === undefined && dueAt <= Date.now()) {
+				const resolved: WorkflowWait = { waitId, kind: "sleep", dueAt, ...(relativeDuration === undefined ? {} : { durationMs: relativeDuration }), status: "resolved", outcome: "elapsed" };
+				await writeEvent(tx, run.conversationId, { type: "wait.registered", runId: task.input.runId, waitId, kind: "sleep", dueAt });
+				await writeEvent(tx, run.conversationId, { type: "wait.resolved", runId: task.input.runId, waitId, kind: "sleep", dueAt });
+				run.currentWait = resolved;
+				return { status: "running" as const, checkpoint: { ...checkpoint, waits: { ...waits, [waitId]: resolved } } };
+			}
+			if (prior !== undefined && dueAt <= Date.now()) {
+				const resolved: WorkflowWait = { ...prior, status: "resolved", outcome: "elapsed" };
+				await writeEvent(tx, run.conversationId, { type: "wait.resolved", runId: task.input.runId, waitId, kind: "sleep", dueAt });
+				run.currentWait = resolved;
+				return { status: "running" as const, checkpoint: { ...checkpoint, waits: { ...waits, [waitId]: resolved } } };
+			}
+			const wait: WorkflowWait = prior ?? { waitId, kind: "sleep", dueAt, ...(relativeDuration === undefined ? {} : { durationMs: relativeDuration }), status: "unresolved" };
+			run.currentWait = wait;
+			if (prior === undefined) await writeEvent(tx, run.conversationId, { type: "wait.registered", runId: task.input.runId, waitId, kind: "sleep", dueAt });
+			run.status = "waiting";
+			shouldSuspend = true;
+			return { status: "waiting" as const, on: [], policy: "allSettled" as const, external: true, checkpoint: { ...checkpoint, waits: { ...waits, [waitId]: wait } } };
+		}, context);
+		if (shouldSuspend) throw new SuspendWorkflow();
+	};
+	const waitForEvent = async <T extends JsonValue>(waitId: string, eventType: string, options?: { timeout?: Duration }): Promise<{ readonly eventId: string; readonly payload: T }> => {
+		if (waitId.length === 0 || eventType.length === 0) throw new TypeError("Workflow event wait ID and type must be non-empty");
+		if (visitedWaits.has(waitId)) throw new Error(`Workflow wait ${waitId} was called more than once in one invocation`);
+		visitedWaits.add(waitId);
+		const existingLocalWait = activeEventTypes.get(eventType);
+		if (existingLocalWait !== undefined && existingLocalWait !== waitId) throw new Error(`Workflow event type ${eventType} already has an active wait`);
+		activeEventTypes.set(eventType, waitId);
+		const timeoutMs = options?.timeout === undefined ? undefined : durationMilliseconds(options.timeout);
+		const requestedDeadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+		if (requestedDeadline !== undefined && !Number.isSafeInteger(requestedDeadline)) throw new TypeError("Event timeout deadline exceeds the safe integer range");
+		let shouldSuspend = false;
+		let timedOut = false;
+		let result: { eventId: string; payload: JsonValue } | undefined;
+		await runtime.commit(async (tx, current) => {
+			const run = await tx.doc(RUN_DOC, task.input.runId, task.input.runId);
+			const checkpoint = current.state.checkpoint;
+			if (run.selectedOutcome !== undefined || run.stopCommand !== undefined) return { status: "running" as const, checkpoint };
+			const waits = checkpoint.waits ?? {};
+			const prior = waits[waitId];
+			if (prior !== undefined) {
+				if (prior.kind !== "event" || prior.eventType !== eventType || (timeoutMs === undefined ? prior.durationMs !== undefined : prior.durationMs !== timeoutMs)) throw new Error(`Workflow event wait ${waitId} changed type or timeout`);
+				if (prior.status === "resolved") {
+					activeEventTypes.delete(eventType);
+					run.currentWait = prior;
+					if (prior.outcome === "timeout") timedOut = true;
+					else if (prior.eventId !== undefined && prior.payload !== undefined) result = { eventId: prior.eventId, payload: prior.payload };
+					return { status: "running" as const, checkpoint };
+				}
+			}
+			const selected = run.currentWait === undefined ? undefined : copyJson(run.currentWait) as WorkflowWait;
+			if (prior !== undefined && selected?.waitId === waitId && selected.status === "resolved") {
+				activeEventTypes.delete(eventType);
+				if (selected.outcome === "timeout") timedOut = true;
+				else if (selected.eventId !== undefined && selected.payload !== undefined) result = { eventId: selected.eventId, payload: selected.payload };
+				return { status: "running" as const, checkpoint: { ...checkpoint, waits: { ...waits, [waitId]: selected } } };
+			}
+			const deadline = prior?.dueAt ?? requestedDeadline;
+			const active = Object.values(waits).filter((wait) => wait.status === "unresolved" && wait.kind === "event" && wait.eventType === eventType && wait.waitId !== waitId);
+			if (active.length > 0) throw new Error(`Workflow event type ${eventType} already has an active wait`);
+			const mailbox = copyJson(run.events ?? []) as WorkflowMailboxEvent[];
+			const available = mailbox.find((event) => event.type === eventType && event.consumedBy === undefined);
+			if (available !== undefined) {
+				activeEventTypes.delete(eventType);
+				run.events = mailbox.map((event) => event.eventId === available.eventId ? { ...event, consumedBy: waitId } : event);
+				const resolved: WorkflowWait = { waitId, kind: "event", eventType, ...(timeoutMs === undefined ? {} : { durationMs: timeoutMs }), status: "resolved", outcome: "event", eventId: available.eventId, payload: available.payload };
+				result = { eventId: available.eventId, payload: available.payload };
+				run.currentWait = resolved;
+				await writeEvent(tx, run.conversationId, { type: "wait.registered", runId: task.input.runId, waitId, kind: "event", eventType });
+				await writeEvent(tx, run.conversationId, { type: "event.accepted", runId: task.input.runId, eventId: available.eventId, eventType, digest: available.digest });
+				await writeEvent(tx, run.conversationId, { type: "wait.resolved", runId: task.input.runId, waitId, kind: "event", eventType });
+				return { status: "running" as const, checkpoint: { ...checkpoint, waits: { ...waits, [waitId]: resolved } } };
+			}
+			if (deadline !== undefined && deadline <= Date.now()) {
+				activeEventTypes.delete(eventType);
+				const resolved: WorkflowWait = { waitId, kind: "event", eventType, dueAt: deadline, ...(timeoutMs === undefined ? {} : { durationMs: timeoutMs }), status: "resolved", outcome: "timeout" };
+				timedOut = true;
+				run.currentWait = resolved;
+				await writeEvent(tx, run.conversationId, { type: "wait.timed_out", runId: task.input.runId, waitId, kind: "event", dueAt: deadline, eventType });
+				return { status: "running" as const, checkpoint: { ...checkpoint, waits: { ...waits, [waitId]: resolved } } };
+			}
+			const wait: WorkflowWait = prior ?? { waitId, kind: "event", eventType, ...(deadline === undefined ? {} : { dueAt: deadline }), ...(timeoutMs === undefined ? {} : { durationMs: timeoutMs }), status: "unresolved" };
+			run.currentWait = wait;
+			if (prior === undefined) await writeEvent(tx, run.conversationId, { type: "wait.registered", runId: task.input.runId, waitId, kind: "event", ...(deadline === undefined ? {} : { dueAt: deadline }), eventType });
+			run.status = "waiting";
+			shouldSuspend = true;
+			return { status: "waiting" as const, on: [], policy: "allSettled" as const, external: true, checkpoint: { ...checkpoint, waits: { ...waits, [waitId]: wait } } };
+		}, context);
+		if (shouldSuspend) throw new SuspendWorkflow();
+		if (timedOut) throw new WorkflowEventTimeoutError(waitId);
+		if (result === undefined) throw new Error(`Workflow event wait ${waitId} did not resolve`);
+		return result as { readonly eventId: string; readonly payload: T };
+	};
 	return {
+		sleepUntil: (waitId, at) => sleepUntil(waitId, at),
+		waitForEvent,
+		sleep: (waitId, duration) => {
+			let durationMs: number;
+			try { durationMs = durationMilliseconds(duration); } catch (error) { return Promise.reject(error); }
+			return sleepUntil(waitId, undefined, durationMs);
+		},
 		do: (operationId, callback, options = {}) => {
 			if (operationId.length === 0)
 				return Promise.reject(
@@ -1179,6 +1377,7 @@ function createWorkflowTask(
 				effects.closeAdmission();
 				const drained = await effects.drain();
 				if (control.finished) return;
+				if (failed && failure instanceof SuspendWorkflow) return;
 				if (!failed && drained.failed) {
 					failed = true;
 					failure = drained.error;
@@ -1229,13 +1428,14 @@ export function createWorkflowRuntimeKernel() {
 	return {
 		task,
 		extension,
-		createEngine: (harness: Harness) =>
-			new WorkflowEngine(harness, registry, task, stopFailures),
+		createEngine: (harness: Harness, timerOptions?: WorkflowTimerOptions) =>
+			new WorkflowEngine(harness, registry, task, stopFailures, timerOptions),
 	};
 }
 
 export class WorkflowEngine {
 	readonly #harness: Harness;
+	readonly #timerHost: WorkflowTimerHost<WorkflowCheckpoint>;
 	readonly #definitions: DefinitionRegistry;
 	readonly #task: typeof WorkflowRuntimeTask;
 	readonly #stopFailures: StopFailures;
@@ -1248,8 +1448,16 @@ export class WorkflowEngine {
 		registry: DefinitionRegistry = definitions,
 		task = WorkflowRuntimeTask,
 		stopFailures = defaultStopFailures,
+		timerOptions: WorkflowTimerOptions = { scheduleAt: (at, callback) => {
+			const timer = setTimeout(callback, Math.max(0, at - Date.now()));
+			return () => clearTimeout(timer);
+		} },
 	) {
 		this.#harness = harness;
+		this.#timerHost = new WorkflowTimerHost(harness, task.definition.name, (checkpoint) => {
+			const deadlines = Object.values(checkpoint.waits ?? {}).filter((wait) => wait.status === "unresolved").map((wait) => wait.dueAt).filter((value): value is number => value !== undefined);
+			return deadlines.length === 0 ? undefined : Math.min(...deadlines);
+		}, timerOptions);
 		this.#definitions = registry;
 		this.#task = task;
 		this.#stopFailures = stopFailures;
@@ -1273,6 +1481,7 @@ export class WorkflowEngine {
 	async open(context: Context): Promise<void> {
 		if (this.#closed) throw new Error("WorkflowEngine is closed");
 		this.#opened = true;
+		await this.#timerHost.open(context);
 		this.#harness.resume();
 		await this.#activateCompatible(context);
 	}
@@ -1342,6 +1551,59 @@ export class WorkflowEngine {
 		return { runId: options.runId };
 	}
 
+	async sendEvent(
+		runId: string,
+		event: WorkflowEvent,
+		context: Context,
+	): Promise<boolean> {
+		const eventId = event.id;
+		const eventType = event.type;
+		if (eventId.length === 0 || eventType.length === 0) throw new TypeError("Workflow event ID and type must be non-empty");
+		const frozen = canonicalInput(event.payload);
+		const digest = canonicalInput({ type: eventType, payload: frozen.input }).digest;
+		const root = await this.#harness.root(context);
+		return root.commit(async (tx) => {
+			const run = await tx.doc(RUN_DOC, runId, runId);
+			if (run.taskId === 0) throw new Error(`Workflow run ${runId} does not exist`);
+			const task = await tx.task(run.taskId as TaskId);
+			if (task === undefined) throw new Error(`Workflow task for run ${runId} does not exist`);
+			if (run.selectedOutcome !== undefined || task.state.status === "terminal" || task.state.status === "completing") throw new Error(`Workflow ${runId} is already terminal`);
+			const mailbox = run.events ?? [];
+			const duplicate = mailbox.find((event) => event.eventId === eventId);
+			if (duplicate !== undefined) {
+				if (duplicate.digest !== digest) throw new Error(`Workflow event ID ${eventId} was reused with different content`);
+				return false;
+			}
+			const event: WorkflowMailboxEvent = { eventId, type: eventType, payload: frozen.input, digest };
+			run.events = [...mailbox, event];
+			await writeEvent(tx, run.conversationId, { type: "event.received", runId, eventId, eventType, digest });
+			const checkpoint = task.state.checkpoint as WorkflowCheckpoint;
+			const waits = checkpoint.waits ?? {};
+			const active = Object.values(waits).filter((wait) => wait.status === "unresolved" && wait.kind === "event" && wait.eventType === eventType);
+			if (active.length > 1) throw new Error(`Workflow run ${runId} has ambiguous active waits for ${eventType}`);
+			const waiting = active[0];
+			if (waiting === undefined || (waiting.dueAt !== undefined && waiting.dueAt <= Date.now())) {
+				await writeEvent(tx, run.conversationId, { type: "event.buffered", runId, eventId, eventType, digest });
+				if (waiting !== undefined) {
+					const timeout: WorkflowWait = { ...waiting, status: "resolved", outcome: "timeout" };
+					run.currentWait = timeout;
+					run.status = "running";
+					await writeEvent(tx, run.conversationId, { type: "wait.timed_out", runId, waitId: waiting.waitId, kind: "event", dueAt: waiting.dueAt, eventType });
+					await tx.wakeTask(run.taskId as TaskId, `event-timeout:${waiting.waitId}:${waiting.dueAt}`);
+				}
+				return true;
+			}
+			event.consumedBy = waiting.waitId;
+			const resolved: WorkflowWait = { ...waiting, status: "resolved", outcome: "event", eventId, payload: frozen.input };
+			run.currentWait = resolved;
+			run.status = "running";
+			await writeEvent(tx, run.conversationId, { type: "event.accepted", runId, eventId, eventType, digest });
+			await writeEvent(tx, run.conversationId, { type: "wait.resolved", runId, waitId: waiting.waitId, kind: "event", eventType });
+			await tx.wakeTask(run.taskId as TaskId, `event:${eventId}`);
+			return true;
+		}, context);
+	}
+
 	async inspect(runId: string, context: Context): Promise<WorkflowInspection> {
 		const snapshot = await this.#harness.snapshot(RUN_DOC, runId, context);
 		if (snapshot === undefined || snapshot.taskId === 0)
@@ -1351,6 +1613,9 @@ export class WorkflowEngine {
 			const task = await tx.task(run.taskId as TaskId);
 			if (task === undefined)
 				throw new Error(`Workflow task for run ${runId} does not exist`);
+			const taskCheckpoint = "checkpoint" in task.state && task.state.checkpoint !== null ? task.state.checkpoint as WorkflowCheckpoint : undefined;
+			const unresolvedWaits = Object.values(taskCheckpoint?.waits ?? {}).filter((wait) => wait.status === "unresolved");
+			const ingressResolvedWait = unresolvedWaits.some((wait) => wait.waitId === run.currentWait?.waitId && run.currentWait.status === "resolved");
 			const status =
 				task.state.status === "terminal" || task.state.status === "completing"
 					? task.state.outcome.status === "completed"
@@ -1360,7 +1625,9 @@ export class WorkflowEngine {
 							: "failed"
 					: run.status === "incompatible" && task.state.status === "waiting"
 						? "incompatible"
-						: "running";
+						: task.state.status === "waiting" && task.state.external === true && unresolvedWaits.length > 0 && !ingressResolvedWait
+							? "waiting"
+							: "running";
 			const operations = copyJson(run.operations) as Record<
 				string,
 				OperationProjection
@@ -1383,6 +1650,12 @@ export class WorkflowEngine {
 				status,
 				operations,
 				operationsTruncated: run.operationsTruncated ?? 0,
+				...(run.currentWait === undefined ? {} : { current: {
+					waitId: run.currentWait.waitId,
+					kind: run.currentWait.kind,
+					...(run.currentWait.eventType === undefined ? {} : { eventType: run.currentWait.eventType }),
+					...(run.currentWait.dueAt === undefined ? {} : { dueAt: run.currentWait.dueAt }),
+				} }),
 				...(status === "stopped"
 					? {
 							cleanup: {
@@ -1480,6 +1753,7 @@ export class WorkflowEngine {
 
 	async close(): Promise<void> {
 		this.#closed = true;
+		this.#timerHost.close();
 		for (const reject of this.#stopWaiters)
 			reject(new Error("WorkflowEngine is closed"));
 	}
@@ -1498,6 +1772,10 @@ export class WorkflowEngine {
 					cursor,
 				);
 				for (const task of page.items) {
+					// Only durable workflow waits are owned by timer/event ingress.
+					// Incompatible/uncertain Tasks also park externally but must be
+					// reactivated when their definition becomes available.
+					if (task.state.status === "waiting" && task.state.external === true && Object.values((task.state.checkpoint as WorkflowCheckpoint).waits ?? {}).some((wait) => wait.status === "unresolved")) continue;
 					const input = task.input as WorkflowTaskInput;
 					if (
 						this.#definitions.has(
@@ -1518,3 +1796,6 @@ export class WorkflowEngine {
 		}, context);
 	}
 }
+
+/** Shared production kernel installed by Pocket's workflow extension. */
+export const pocketWorkflowRuntime = createWorkflowRuntimeKernel();

@@ -20,7 +20,7 @@ import {
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { afterEach, describe, it as nodeIt } from "node:test";
 import { allEntries, eventually, textOf, unanswered } from "./workflow-test-support.ts";
-import { NonRetryableError, WorkflowEngine, WorkflowTask, workflow } from "../packages/workflow-runtime/index.ts";
+import { NonRetryableError, WorkflowEngine, WorkflowTask, workflow } from "../packages/workflow-runtime/legacy.ts";
 
 const context = BACKGROUND_CONTEXT;
 const directories = new Set<string>();

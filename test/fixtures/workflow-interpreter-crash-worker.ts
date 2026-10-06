@@ -4,7 +4,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai";
 import { createRegistry, defineExtension, Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { WorkflowEngine, WorkflowTask, workflow } from "../../packages/workflow-runtime/index.ts";
+import { WorkflowEngine, WorkflowTask, workflow } from "../../packages/workflow-runtime/legacy.ts";
 
 const mode = process.env.PI_MODE;
 const now = Number(process.env.PI_NOW);

@@ -3,10 +3,10 @@ import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai";
 import { createRegistry, defineExtension, Harness, MemoryStorage } from "@earendil-works/pi-durable";
-import { WorkflowEngine, WorkflowTask, workflow } from "../packages/workflow-runtime/index.ts";
+import { WorkflowEngine, WorkflowTask, workflow } from "../packages/workflow-runtime/legacy.ts";
 import { eventually } from "./workflow-test-support.ts";
 
-test("a timer wake failure is reported without retrying or deciding the workflow outcome", async () => {
+test("a timer wake failure is reported and re-armed without deciding the workflow outcome", async () => {
 	const registry = createRegistry();
 	registry.install(defineExtension({ name: "pocket-workflows-test", tasks: [WorkflowTask] }));
 	const harness = await Harness.open(
@@ -38,7 +38,7 @@ test("a timer wake failure is reported without retrying or deciding the workflow
 		fire!();
 		await eventually(() => failures.length === 1);
 		assert.ok(failures[0] instanceof Error);
-		assert.equal(scheduled, 1);
+		assert.equal(scheduled, 2, "a failed infrastructure wake is re-armed");
 	} finally {
 		await engine.close();
 		await harness.close(BACKGROUND_CONTEXT);

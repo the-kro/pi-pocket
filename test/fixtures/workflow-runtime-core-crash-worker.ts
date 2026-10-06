@@ -148,6 +148,11 @@ const storage = new Proxy(backing, {
 					await new Promise(() => {});
 				}
 				const seq = await target.commit(writes, context);
+				if (mode === "event-ingress-start" && workflowEvents.some((event) => event.type === "event.received")) {
+					process.stdout.write("STAGED:event-receipt");
+					setInterval(() => {}, 60_000);
+					await new Promise(() => {});
+				}
 				if (
 					mode === "stop-hold-recover" &&
 					writes.some(
@@ -228,6 +233,11 @@ const feature = defineWorkflow({
 	id: `core.crash.${scenario}`,
 	version: 1,
 	async run({ step, signal }) {
+		if (scenario === "event") {
+			const event = await step.waitForEvent<{ ok: boolean }>("signal", "core.signal");
+			await appendFile(effectLog, `${event.eventId}:${event.payload.ok ? "true" : "false"}\n`);
+			return event.payload;
+		}
 		if (scenario === "stop-fence") {
 			await appendFile(bodyLog, `${mode}${String.fromCharCode(10)}`);
 			process.stdout.write(`BODY:${mode}`);
@@ -319,7 +329,25 @@ const feature = defineWorkflow({
 });
 engine.register(feature);
 await engine.open(BACKGROUND_CONTEXT);
-if (mode === "stop-reservation-start" || mode === "stop-receipt-start") {
+if (mode === "event-wait-start") {
+	await engine.start(feature, null, { runId: "core-event" }, BACKGROUND_CONTEXT);
+	const deadline = Date.now() + 10_000;
+	for (;;) {
+		const inspection = await engine.inspect("core-event", BACKGROUND_CONTEXT);
+		if (inspection.status === "waiting") break;
+		if (Date.now() > deadline) throw new Error("Event workflow did not park");
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	process.stdout.write("EVENT_WAITING");
+	setInterval(() => {}, 60_000);
+	await new Promise(() => {});
+} else if (mode === "event-ingress-start") {
+	await engine.sendEvent("core-event", { id: "crash-event", type: "core.signal", payload: { ok: true } }, BACKGROUND_CONTEXT);
+} else if (mode === "event-recover") {
+	const result = await engine.wait("core-event", BACKGROUND_CONTEXT);
+	process.stdout.write(`RESULT:${JSON.stringify(result)}\n`);
+	process.stdout.write(`INSPECT:${JSON.stringify(await engine.inspect("core-event", BACKGROUND_CONTEXT))}`);
+} else if (mode === "stop-reservation-start" || mode === "stop-receipt-start") {
 	await engine.start(
 		feature,
 		null,

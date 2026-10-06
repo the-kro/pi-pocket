@@ -7,8 +7,8 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai";
 import { createRegistry, Harness, type TaskId } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { createWorkflowRuntimeKernel, defineWorkflow } from "../packages/workflow-runtime/core/index.ts";
-import { WorkflowEngine, WorkflowTask, workflow } from "../packages/workflow-runtime/index.ts";
+import { defineWorkflow, pocketWorkflowRuntime, WorkflowEngine as ProductionWorkflowEngine } from "../packages/workflow-runtime/core/index.ts";
+import { WorkflowEngine as PublicWorkflowEngine } from "../packages/workflow-runtime/index.ts";
 import createWorkflows from "../src/server/extensions/workflows.ts";
 import type { PocketHost } from "../src/server/host.ts";
 
@@ -38,20 +38,18 @@ async function eventually(check: () => boolean | Promise<boolean>, description: 
 	}
 }
 
-test("Pocket composes the opt-in core for a test smoke without replacing its served workflow runtime", async () => {
+test("Pocket serves the production workflow core as its canonical runtime across reopen", async () => {
 	const coreDataDir = join(root, "core-smoke-data");
 	mkdirSync(coreDataDir, { recursive: true });
-	const openCoreApp = (kernel: ReturnType<typeof createWorkflowRuntimeKernel>) =>
+	const openCoreApp = () =>
 		PocketApp.open({
 			dataDir: coreDataDir,
 			defaultCwd: workingDirectory,
 			supervised: false,
 			log: () => {},
-			testExtensions: [kernel.extension],
 		});
 	let effectCalls = 0;
 	let stepCompleted = false;
-	const firstKernel = createWorkflowRuntimeKernel();
 	const smokeWorkflow = defineWorkflow({
 		id: "pocket.test.production-workflow-core-smoke",
 		version: 1,
@@ -68,14 +66,15 @@ test("Pocket composes the opt-in core for a test smoke without replacing its ser
 			return result;
 		},
 	});
-	const firstApp = await openCoreApp(firstKernel);
+	const firstApp = await openCoreApp();
 	app = firstApp;
 	const servedRuntime = firstApp.workflowEngine;
 	assert.ok(servedRuntime);
-	const firstEngine = firstKernel.createEngine(firstApp.harness);
+	assert.ok(servedRuntime instanceof ProductionWorkflowEngine, "Pocket must serve the production runtime as its canonical workflow engine");
+	assert.equal(PublicWorkflowEngine, ProductionWorkflowEngine, "the package entry point must name the production runtime as canonical");
+	const firstEngine = firstApp.workflowEngine!;
 	try {
 		firstEngine.register(smokeWorkflow);
-		await firstEngine.open(BACKGROUND_CONTEXT);
 		const handle = await firstEngine.start(
 			smokeWorkflow,
 			{ smoke: true },
@@ -88,7 +87,7 @@ test("Pocket composes the opt-in core for a test smoke without replacing its ser
 		assert.equal(running.status, "running");
 		assert.equal(running.operations["smoke-effect"]?.status, "completed");
 		assert.equal(effectCalls, 1);
-		assert.equal(firstApp.workflowEngine, servedRuntime, "the smoke does not replace Pocket's current interpreter");
+		assert.equal(firstApp.workflowEngine, servedRuntime, "Pocket uses one canonical engine instance");
 
 		await firstEngine.stop(handle.runId, "smoke lifecycle stop", BACKGROUND_CONTEXT);
 		await assert.rejects(firstEngine.wait(handle.runId, BACKGROUND_CONTEXT), /stopped/);
@@ -101,16 +100,14 @@ test("Pocket composes the opt-in core for a test smoke without replacing its ser
 		if (app === firstApp) app = undefined;
 	}
 
-	const secondKernel = createWorkflowRuntimeKernel();
-	const secondApp = await openCoreApp(secondKernel);
+	const secondApp = await openCoreApp();
 	app = secondApp;
 	const secondServedRuntime = secondApp.workflowEngine;
 	assert.ok(secondServedRuntime);
 	assert.notEqual(secondServedRuntime, servedRuntime, "reopen owns a fresh current interpreter");
-	const secondEngine = secondKernel.createEngine(secondApp.harness);
+	const secondEngine = secondApp.workflowEngine!;
 	try {
 		secondEngine.register(smokeWorkflow);
-		await secondEngine.open(BACKGROUND_CONTEXT);
 		const recovered = await secondEngine.inspect("pocket-core-smoke", BACKGROUND_CONTEXT);
 		assert.equal(recovered.status, "stopped");
 		assert.equal(recovered.operations["smoke-effect"]?.status, "completed");
@@ -131,11 +128,15 @@ test("Pocket re-arms a parked workflow timer once per Harness and keeps it acros
 		{ models: createModels(), registry },
 		BACKGROUND_CONTEXT,
 	);
-	const seedEngine = new WorkflowEngine(harness, { scheduleAt: () => () => {} });
+	const seedEngine = pocketWorkflowRuntime.createEngine(harness, { scheduleAt: () => () => {} });
 	const wakeAt = Date.now() + 2_500;
-	const sleeping = workflow<{ wakeAt: number }, string>("pocket.runtime-restart", async ({ input, step }) => {
-		await step.sleepUntil("deadline", input.wakeAt);
-		return "timer-resumed";
+	const sleeping = defineWorkflow({
+		id: "pocket.runtime-restart",
+		version: 1,
+		async run({ input, step }) {
+			await step.sleepUntil("deadline", (input as { wakeAt: number }).wakeAt);
+			return "timer-resumed";
+		},
 	});
 	let taskId: TaskId | undefined;
 	try {
@@ -143,12 +144,12 @@ test("Pocket re-arms a parked workflow timer once per Harness and keeps it acros
 		const handle = await seedEngine.start(
 			sleeping,
 			{ wakeAt },
-			await harness.root(BACKGROUND_CONTEXT),
+			{ runId: "pocket.runtime-restart" },
 			BACKGROUND_CONTEXT,
 		);
-		await eventually(async () => (await seedEngine.inspect(handle, BACKGROUND_CONTEXT)).status === "waiting", "the stored sleep");
+		await eventually(async () => (await seedEngine.inspect(handle.runId, BACKGROUND_CONTEXT)).status === "waiting", "the stored sleep");
 		const record = (await harness.inspect(BACKGROUND_CONTEXT)).tasks.find(
-			(item) => item.record.kind === WorkflowTask.definition.name,
+			(item) => item.record.kind === pocketWorkflowRuntime.task.definition.name,
 		);
 		assert.ok(record);
 		taskId = record.record.id as typeof taskId;
@@ -163,6 +164,7 @@ test("Pocket re-arms a parked workflow timer once per Harness and keeps it acros
 	app = await PocketApp.open({ dataDir, defaultCwd: workingDirectory, supervised: false, log: (line) => appLog.push(line) });
 	const engine = app.workflowEngine;
 	assert.ok(engine);
+	assert.ok(engine instanceof ProductionWorkflowEngine);
 	let addedSubscriptions = 0;
 	const subscribeCommits = app.harness.subscribeCommits.bind(app.harness);
 	app.harness.subscribeCommits = (listener) => {

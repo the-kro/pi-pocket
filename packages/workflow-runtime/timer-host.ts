@@ -54,6 +54,7 @@ export class WorkflowTimerHost<S extends JsonValue> {
 	}
 
 	close(): void {
+		this.#context = undefined;
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
 		for (const cancel of this.#timers.values()) cancel();
@@ -75,12 +76,19 @@ export class WorkflowTimerHost<S extends JsonValue> {
 			return;
 		}
 		if (existing !== undefined) return;
-		const cancel = this.#options.scheduleAt(wakeAt, () => {
-			this.#timers.delete(id);
-			const context = this.#context;
-			if (context === undefined) return;
-			void this.#harness.commit((tx) => tx.wakeTask(id, `sleep:${id}:${wakeAt}`), context).catch(this.#onError);
-		});
-		this.#timers.set(id, cancel);
+		const arm = (at: number): void => {
+			const cancel = this.#options.scheduleAt(at, () => {
+				this.#timers.delete(id);
+				const context = this.#context;
+				if (context === undefined) return;
+				void this.#harness.commit((tx) => tx.wakeTask(id, `sleep:${id}:${wakeAt}`), context).catch((error: unknown) => {
+					this.#onError(error);
+					// A failed infrastructure wake must not orphan a durable wait.
+					if (this.#context !== undefined && !this.#timers.has(id)) arm(Date.now() + 1_000);
+				});
+			});
+			this.#timers.set(id, cancel);
+		};
+		arm(wakeAt);
 	}
 }

@@ -197,6 +197,37 @@ function inspectionFrom(output: string): {
 	};
 }
 
+test("event receipt and wake survive SIGKILL after storage commit but before host acknowledgement", async () => {
+	assert.ok(core, "the production workflow runtime core module must exist");
+	const directory = await mkdtemp(join(tmpdir(), "pi-pocket-workflow-event-crash-"));
+	directories.add(directory);
+	const database = join(directory, "workflow.sqlite");
+	const effects = join(directory, "effects.log");
+	const marker = join(directory, "marker");
+	const options = { PI_CORE_SCENARIO: "event" };
+	let waiter: ChildProcess | undefined = startWorker("event-wait-start", database, effects, marker, options);
+	let ingress: ChildProcess | undefined;
+	let recovered: ChildProcess | undefined;
+	try {
+		await outputUntil(waiter, "EVENT_WAITING");
+		ingress = startWorker("event-ingress-start", database, effects, marker, options);
+		await outputUntil(ingress, "STAGED:event-receipt");
+		await killWorker(ingress);
+		ingress = undefined;
+		await killWorker(waiter);
+		waiter = undefined;
+		recovered = startWorker("event-recover", database, effects, marker, options);
+		const output = await outputUntil(recovered, "INSPECT:");
+		assert.deepEqual(await workerExit(recovered), [0, null]);
+		assert.ok(output.includes('RESULT:{"ok":true}'));
+		assert.match(output, /\"status\":\"completed\"/);
+	} finally {
+		if (ingress !== undefined) await killWorker(ingress);
+		if (waiter !== undefined) await killWorker(waiter);
+		if (recovered !== undefined) await killWorker(recovered);
+	}
+});
+
 test("SIGKILL on either side of the atomic admission batch exposes no partial run", async () => {
 	assert.ok(core, "the production workflow runtime core module must exist");
 	for (const mode of ["admission-before", "admission-after"] as const) {
@@ -1550,8 +1581,8 @@ test("engine close releases a stop caller held before initial snapshot and never
 		await assert.rejects(stopping, /WorkflowEngine is closed/);
 		assert.equal(
 			commands,
-			1,
-			"only open's compatible-activation command may commit",
+			2,
+			"open scans deadlines before compatible activation and stop submits no command",
 		);
 	} finally {
 		release();
