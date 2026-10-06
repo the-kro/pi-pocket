@@ -12,7 +12,7 @@ import {
 } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import type { FauxResponseStep } from "@earendil-works/pi-ai";
@@ -70,6 +70,35 @@ const route: FauxResponseStep = (request) => {
         );
     }
 
+    if (text.includes("write absolute:")) {
+        const path = text.slice(text.indexOf("write absolute:") + "write absolute:".length).trim();
+
+        return fauxAssistantMessage(
+            [
+                fauxToolCall("write", {
+                    path,
+                    content: "absolute edit\n",
+                }),
+            ],
+            { stopReason: "toolUse" },
+        );
+    }
+
+    if (text.includes("script absolute:")) {
+        const path = text
+            .slice(text.indexOf("script absolute:") + "script absolute:".length)
+            .trim();
+
+        return fauxAssistantMessage(
+            [
+                fauxToolCall("codemode", {
+                    code: `await tools.write({ path: ${JSON.stringify(path)}, content: "absolute script\\n" });`,
+                }),
+            ],
+            { stopReason: "toolUse" },
+        );
+    }
+
     if (text.endsWith("script it")) {
         return fauxAssistantMessage(
             [
@@ -115,7 +144,7 @@ test("a session's changes list git's uncommitted files, mark Pi's, and give each
 
     const changes = await app.workspace.changes(id, owner(app));
 
-    assert.equal(changes.repo?.root, repo);
+    assert.equal(changes.repo?.root, realpathSync(repo));
     assert.match(changes.repo?.branch ?? "", /^(main|master)$/);
     assert.deepEqual(
         changes.files.map(({ path, kind, added, removed, byPi }) => ({
@@ -191,6 +220,42 @@ function repository(name: string, files: Record<string, string>): string {
 
     return folder;
 }
+
+function symlinkDirectory(target: string, link: string): void {
+    symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
+}
+
+test("absolute direct-write paths through a symlinked cwd are attributed to Pi", async () => {
+    const folder = repository("absolute-direct", { "seed.txt": "seed\n" });
+    const alias = join(root, "absolute-direct-alias");
+
+    symlinkDirectory(folder, alias);
+    const id = await newSession(app, alias);
+
+    const path = join(alias, "direct.txt");
+
+    await say(app, id, `write absolute: ${path}`);
+    assert.equal(existsSync(path), true, "the write created its target file");
+    const changes = await app.workspace.changes(id, owner(app));
+
+    assert.equal(changes.files.find((file) => file.path === "direct.txt")?.byPi, true);
+});
+
+test("absolute codemode paths through a symlinked cwd are attributed to Pi", async () => {
+    const folder = repository("absolute-codemode", { "seed.txt": "seed\n" });
+    const alias = join(root, "absolute-codemode-alias");
+
+    symlinkDirectory(folder, alias);
+    const id = await newSession(app, alias);
+
+    const path = join(alias, "scripted.txt");
+
+    await say(app, id, `script absolute: ${path}`);
+    assert.equal(existsSync(path), true, "the codemode write created its target file");
+    const changes = await app.workspace.changes(id, owner(app));
+
+    assert.equal(changes.files.find((file) => file.path === "scripted.txt")?.byPi, true);
+});
 
 test("someone invited to one session sees the changes in its folder, not the rest of the repository", async () => {
     const shared = repository("shared", {
