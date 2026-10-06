@@ -32,16 +32,16 @@ Example:
 
 ```ts
 type AgentProfile = {
-  id: "implementer" | "reviewer" | "plan-writer";
-  version: number;
+    id: "implementer" | "reviewer" | "plan-writer";
+    version: number;
 
-  instructions: string;
+    instructions: string;
 
-  modelRoute: string;
+    modelRoute: string;
 
-  capabilities: AgentCapabilities;
+    capabilities: AgentCapabilities;
 
-  structuredResult?: Schema;
+    structuredResult?: Schema;
 };
 ```
 
@@ -179,20 +179,20 @@ Example:
 
 ```ts
 type ReviewResult =
-  | {
-      verdict: "APPROVED";
-      summary: string;
-    }
-  | {
-      verdict: "CHANGES_REQUIRED";
-      summary: string;
-      findings: Finding[];
-    }
-  | {
-      verdict: "BLOCKED";
-      summary: string;
-      reason: string;
-    };
+    | {
+          verdict: "APPROVED";
+          summary: string;
+      }
+    | {
+          verdict: "CHANGES_REQUIRED";
+          summary: string;
+          findings: Finding[];
+      }
+    | {
+          verdict: "BLOCKED";
+          summary: string;
+          reason: string;
+      };
 ```
 
 Pi-native structured output should be used if it provides the required exact correlation and durability.

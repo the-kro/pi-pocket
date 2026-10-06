@@ -14,7 +14,7 @@ Example:
 
 ```ts
 await workflows.start(startWork, input, {
-  runId: "start-work:workspace-123:request-456",
+    runId: "start-work:workspace-123:request-456",
 });
 ```
 
@@ -22,11 +22,11 @@ Admission persists:
 
 ```ts
 type WorkflowAdmission = {
-  runId: string;
-  workflowId: string;
-  workflowVersion: number;
-  input: JsonValue;
-  inputDigest: string;
+    runId: string;
+    workflowId: string;
+    workflowVersion: number;
+    input: JsonValue;
+    inputDigest: string;
 };
 ```
 
@@ -44,9 +44,9 @@ A workflow definition has:
 
 ```ts
 type WorkflowDefinition<I, O> = {
-  id: string;
-  version: number;
-  run(context: WorkflowContext<I>): Promise<O>;
+    id: string;
+    version: number;
+    run(context: WorkflowContext<I>): Promise<O>;
 };
 ```
 
@@ -77,12 +77,12 @@ Representative API:
 
 ```ts
 const workflow = defineWorkflow({
-  id: "start-work-v0",
-  version: 1,
+    id: "start-work-v0",
+    version: 1,
 
-  async run({ input, step, signal }) {
-    // ordinary TypeScript
-  },
+    async run({ input, step, signal }) {
+        // ordinary TypeScript
+    },
 });
 ```
 
@@ -90,22 +90,19 @@ Core engine:
 
 ```ts
 interface WorkflowEngine {
-  start<I, O>(
-    definition: WorkflowDefinition<I, O>,
-    input: I,
-    options: { runId: string },
-  ): Promise<WorkflowHandle<O>>;
+    start<I, O>(
+        definition: WorkflowDefinition<I, O>,
+        input: I,
+        options: { runId: string },
+    ): Promise<WorkflowHandle<O>>;
 
-  inspect(runId: string): Promise<WorkflowInspection>;
+    inspect(runId: string): Promise<WorkflowInspection>;
 
-  sendEvent(
-    runId: string,
-    event: WorkflowEvent,
-  ): Promise<EventDeliveryResult>;
+    sendEvent(runId: string, event: WorkflowEvent): Promise<EventDeliveryResult>;
 
-  stop(runId: string, reason?: string): Promise<void>;
+    stop(runId: string, reason?: string): Promise<void>;
 
-  wait<O>(runId: string): Promise<O>;
+    wait<O>(runId: string): Promise<O>;
 }
 ```
 
@@ -113,26 +110,26 @@ Core step API:
 
 ```ts
 interface WorkflowStep {
-  do<T>(
-    id: string,
-    callback: (ctx: StepExecution) => Promise<T> | T,
-    options?: StepDoOptions<T>,
-  ): Promise<T>;
+    do<T>(
+        id: string,
+        callback: (ctx: StepExecution) => Promise<T> | T,
+        options?: StepDoOptions<T>,
+    ): Promise<T>;
 
-  sleep(id: string, duration: Duration): Promise<void>;
+    sleep(id: string, duration: Duration): Promise<void>;
 
-  sleepUntil(id: string, at: number | Date): Promise<void>;
+    sleepUntil(id: string, at: number | Date): Promise<void>;
 
-  waitForEvent<T>(
-    id: string,
-    type: string,
-    options?: {
-      timeout?: Duration;
-    },
-  ): Promise<{
-    eventId: string;
-    payload: T;
-  }>;
+    waitForEvent<T>(
+        id: string,
+        type: string,
+        options?: {
+            timeout?: Duration;
+        },
+    ): Promise<{
+        eventId: string;
+        payload: T;
+    }>;
 }
 ```
 
@@ -154,26 +151,26 @@ Example:
 
 ```ts
 const result = await step.do(
-  "deploy",
-  async ({ attempt, idempotencyKey, signal }) => {
-    return deploy({
-      idempotencyKey,
-      signal,
-    });
-  },
-  {
-    retries: 2,
-    interrupted: "reconcile",
-    reconcile: async context => {
-      const deployment = await lookupDeployment(context.idempotencyKey);
-
-      if (deployment) {
-        return recovery.completed(deployment);
-      }
-
-      return recovery.retry();
+    "deploy",
+    async ({ attempt, idempotencyKey, signal }) => {
+        return deploy({
+            idempotencyKey,
+            signal,
+        });
     },
-  },
+    {
+        retries: 2,
+        interrupted: "reconcile",
+        reconcile: async (context) => {
+            const deployment = await lookupDeployment(context.idempotencyKey);
+
+            if (deployment) {
+                return recovery.completed(deployment);
+            }
+
+            return recovery.retry();
+        },
+    },
 );
 ```
 
@@ -264,10 +261,7 @@ A known `NonRetryableError` bypasses configured known-failure retries.
 ## Interrupted policy
 
 ```ts
-type InterruptedPolicy =
-  | "fail"
-  | "reconcile"
-  | "retry";
+type InterruptedPolicy = "fail" | "reconcile" | "retry";
 ```
 
 ### fail
@@ -294,17 +288,15 @@ V0 reconciliation result:
 
 ```ts
 type RecoveryResult<T> =
-  | { status: "completed"; result: T }
-  | { status: "retry" }
-  | { status: "unknown" };
+    { status: "completed"; result: T } | { status: "retry" } | { status: "unknown" };
 ```
 
 Helper API may be:
 
 ```ts
-recovery.completed(value)
-recovery.retry()
-recovery.unknown()
+recovery.completed(value);
+recovery.retry();
+recovery.unknown();
 ```
 
 Meaning:
@@ -369,19 +361,16 @@ Semantic sleep resolution must still occur at most once.
 Example:
 
 ```ts
-const guidance = await step.waitForEvent<ContinueEvent>(
-  "await-guidance-1",
-  "workflow.continue",
-);
+const guidance = await step.waitForEvent<ContinueEvent>("await-guidance-1", "workflow.continue");
 ```
 
 V0 event identity:
 
 ```ts
 type WorkflowEvent = {
-  id: string;
-  type: string;
-  payload: JsonValue;
+    id: string;
+    type: string;
+    payload: JsonValue;
 };
 ```
 
@@ -564,37 +553,27 @@ V0 inspection should answer:
 
 ```ts
 type WorkflowInspection = {
-  runId: string;
-  workflowId: string;
-  workflowVersion: number;
+    runId: string;
+    workflowId: string;
+    workflowVersion: number;
 
-  status:
-    | "running"
-    | "waiting"
-    | "completed"
-    | "failed"
-    | "stopped"
-    | "incompatible";
+    status: "running" | "waiting" | "completed" | "failed" | "stopped" | "incompatible";
 
-  current?: {
-    operationId?: string;
-    waitId?: string;
-    kind?: string;
-  };
+    current?: {
+        operationId?: string;
+        waitId?: string;
+        kind?: string;
+    };
 
-  operations: Record<
-    string,
-    {
-      status:
-        | "running"
-        | "unknown"
-        | "completed"
-        | "failed";
+    operations: Record<
+        string,
+        {
+            status: "running" | "unknown" | "completed" | "failed";
 
-      latestAttempt: number;
-      error?: string;
-    }
-  >;
+            latestAttempt: number;
+            error?: string;
+        }
+    >;
 };
 ```
 

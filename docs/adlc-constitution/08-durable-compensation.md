@@ -85,16 +85,16 @@ Examples:
 
 ## 8. Crash matrix
 
-| Case | Required behavior |
-|---|---|
-| forward outcome unknown | reconcile forward before deciding compensation eligibility |
-| forward completed, later failure | derive eligible compensation |
-| crash before rollback starts | reconstruct same compensation stack |
-| compensation starts, completion missing | mark outcome unknown; reconcile/retry by explicit policy |
-| external rollback happened but durable completion missing | do not blindly duplicate |
-| restart mid-chain | skip durably completed compensations; continue remaining |
-| Saga compensation failure | stop/escalate |
-| best-effort compensation failure | continue and report residual failures |
+| Case                                                      | Required behavior                                          |
+| --------------------------------------------------------- | ---------------------------------------------------------- |
+| forward outcome unknown                                   | reconcile forward before deciding compensation eligibility |
+| forward completed, later failure                          | derive eligible compensation                               |
+| crash before rollback starts                              | reconstruct same compensation stack                        |
+| compensation starts, completion missing                   | mark outcome unknown; reconcile/retry by explicit policy   |
+| external rollback happened but durable completion missing | do not blindly duplicate                                   |
+| restart mid-chain                                         | skip durably completed compensations; continue remaining   |
+| Saga compensation failure                                 | stop/escalate                                              |
+| best-effort compensation failure                          | continue and report residual failures                      |
 
 ## 9. Stop semantics
 

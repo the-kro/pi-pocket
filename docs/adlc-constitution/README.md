@@ -43,20 +43,20 @@ Also not required by this baseline:
 
 ## Document map
 
-| File | Purpose |
-|---|---|
-| `01-workflow-runtime-contract.md` | Normative durable workflow semantics |
-| `02-operations-waits-events.md` | Detailed operation, sleep, wait, and event behavior |
-| `03-agents-roles-policy.md` | Agent/Role/subagent authority and policy contract |
-| `04-agent-conversations.md` | Continuable actor conversation and retry/recovery semantics |
-| `05-review-verification.md` | Verify, generic Review, TaskReview, structured-result behavior |
-| `06-start-work-reference-workflow.md` | Bread-and-butter developer workflow behavior |
-| `07-capability-lifecycle-context.md` | Capability isolation, disappearance, cleanup, ambient context |
-| `08-durable-compensation.md` | Durable Saga / best-effort compensation semantics |
-| `09-conformance-test-matrix.md` | Runtime-neutral hostile test requirements |
-| `10-architectural-lessons.md` | Non-normative design lessons and anti-patterns |
-| `11-glossary.md` | Shared terminology |
-| `12-intentional-open-questions.md` | Explicitly uncommitted future areas |
+| File                                  | Purpose                                                        |
+| ------------------------------------- | -------------------------------------------------------------- |
+| `01-workflow-runtime-contract.md`     | Normative durable workflow semantics                           |
+| `02-operations-waits-events.md`       | Detailed operation, sleep, wait, and event behavior            |
+| `03-agents-roles-policy.md`           | Agent/Role/subagent authority and policy contract              |
+| `04-agent-conversations.md`           | Continuable actor conversation and retry/recovery semantics    |
+| `05-review-verification.md`           | Verify, generic Review, TaskReview, structured-result behavior |
+| `06-start-work-reference-workflow.md` | Bread-and-butter developer workflow behavior                   |
+| `07-capability-lifecycle-context.md`  | Capability isolation, disappearance, cleanup, ambient context  |
+| `08-durable-compensation.md`          | Durable Saga / best-effort compensation semantics              |
+| `09-conformance-test-matrix.md`       | Runtime-neutral hostile test requirements                      |
+| `10-architectural-lessons.md`         | Non-normative design lessons and anti-patterns                 |
+| `11-glossary.md`                      | Shared terminology                                             |
+| `12-intentional-open-questions.md`    | Explicitly uncommitted future areas                            |
 
 ## Normative language
 

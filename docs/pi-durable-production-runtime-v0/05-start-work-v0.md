@@ -14,19 +14,19 @@ Example input:
 
 ```ts
 type StartWorkV0Input = {
-  workspaceId: string;
+    workspaceId: string;
 
-  plan: {
-    revision: string;
-    text: string;
+    plan: {
+        revision: string;
+        text: string;
 
-    task: {
-      id: string;
-      instructions: string;
+        task: {
+            id: string;
+            instructions: string;
+        };
     };
-  };
 
-  verification: VerificationManifest;
+    verification: VerificationManifest;
 };
 ```
 
@@ -128,7 +128,7 @@ Guidance includes:
 
 ```ts
 type WorkflowGuidanceEvent = {
-  guidance: string;
+    guidance: string;
 };
 ```
 

@@ -104,20 +104,20 @@ Pi owns generic durable execution.
 
 ## Pi primitive mapping
 
-| Requirement | Pi Durable responsibility | Our responsibility |
-|---|---|---|
-| durable execution | Task/checkpoint | logical workflow semantics |
-| restart | scheduler + Task recovery | workflow-function replay |
-| completed work | persisted Task/checkpoint | step result memoization |
-| Task ownership | native ownership | semantic child/thread IDs |
-| cancellation | native propagation | workflow stop semantics |
-| child join | Task dependency/wait | child semantic interpretation |
-| agent execution | Conversation/Generation Tasks | thread/turn protocol |
-| atomicity | Pi transactions | transition meaning |
-| external wait | external-wake patch | event/timer semantics |
-| scheduler | Pi | none |
-| semantic audit | Entries | vocabulary + emission |
-| inspection | snapshots/docs | workflow projection |
+| Requirement       | Pi Durable responsibility     | Our responsibility            |
+| ----------------- | ----------------------------- | ----------------------------- |
+| durable execution | Task/checkpoint               | logical workflow semantics    |
+| restart           | scheduler + Task recovery     | workflow-function replay      |
+| completed work    | persisted Task/checkpoint     | step result memoization       |
+| Task ownership    | native ownership              | semantic child/thread IDs     |
+| cancellation      | native propagation            | workflow stop semantics       |
+| child join        | Task dependency/wait          | child semantic interpretation |
+| agent execution   | Conversation/Generation Tasks | thread/turn protocol          |
+| atomicity         | Pi transactions               | transition meaning            |
+| external wait     | external-wake patch           | event/timer semantics         |
+| scheduler         | Pi                            | none                          |
+| semantic audit    | Entries                       | vocabulary + emission         |
+| inspection        | snapshots/docs                | workflow projection           |
 
 The production runtime must resist taking ownership of responsibilities in the middle column.
 

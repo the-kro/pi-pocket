@@ -10,18 +10,15 @@ API:
 
 ```ts
 type VerificationManifest = {
-  checks: VerificationCheck[];
+    checks: VerificationCheck[];
 };
 
 type VerificationResult = {
-  subjectRevision: string;
+    subjectRevision: string;
 
-  status:
-    | "passed"
-    | "failed"
-    | "interrupted";
+    status: "passed" | "failed" | "interrupted";
 
-  checks: CheckResult[];
+    checks: CheckResult[];
 };
 ```
 
