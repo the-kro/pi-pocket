@@ -26,6 +26,7 @@ import {
 	type ConversationView,
 	type Cursor,
 	createRegistry,
+	type Extension,
 	type EntryId,
 	type EntryRecord,
 	Harness,
@@ -494,6 +495,8 @@ export interface OpenOptions {
 	log?: (line: string) => void;
 	/** Tests register scripted providers here. */
 	configureModels?: (models: ModelRuntime) => void;
+	/** Test-only extension additions for Pocket composition smokes; production starts omit this. */
+	testExtensions?: readonly Extension[];
 }
 
 export class PocketApp {
@@ -509,7 +512,7 @@ export class PocketApp {
 	/** Set by the launcher over IPC; undefined when the server runs on its own. */
 	access: AccessInfo | undefined;
 	harness!: Harness;
-	/** One workflow engine and timer subscription share this app's Harness lifetime. */
+	/** Pocket's served interpreter and timer subscription share this app's Harness lifetime. */
 	workflowEngine: WorkflowEngine | undefined;
 	models!: ModelRuntime;
 	settings!: SettingsManager;
@@ -552,7 +555,7 @@ export class PocketApp {
 
 	static async open(options: OpenOptions): Promise<PocketApp> {
 		const app = new PocketApp(options);
-		await app.#open();
+		await app.#open(options.testExtensions ?? []);
 		return app;
 	}
 
@@ -576,7 +579,7 @@ export class PocketApp {
 		}
 	}
 
-	async #open(): Promise<void> {
+	async #open(testExtensions: readonly Extension[]): Promise<void> {
 		this.#lock();
 		try {
 			this.pushStore = new PushStore(this.dataDir);
@@ -614,6 +617,7 @@ export class PocketApp {
 			this.config.extensionChoice(file),
 		);
 		await this.loader.loadAll();
+		for (const extension of testExtensions) registry.install(extension);
 
 		this.harness = await Harness.open(
 			await openNodeSqliteStorage(join(this.dataDir, "pocket.sqlite")),

@@ -7,9 +7,10 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai";
 import { createRegistry, Harness, type TaskId } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { PocketHost } from "../src/server/host.ts";
-import createWorkflows from "../src/server/extensions/workflows.ts";
+import { createWorkflowRuntimeKernel, defineWorkflow } from "../packages/workflow-runtime/core/index.ts";
 import { WorkflowEngine, WorkflowTask, workflow } from "../packages/workflow-runtime/index.ts";
+import createWorkflows from "../src/server/extensions/workflows.ts";
+import type { PocketHost } from "../src/server/host.ts";
 
 const root = mkdtempSync(join(tmpdir(), "pi-pocket-workflow-runtime-"));
 const dataDir = join(root, "data");
@@ -36,6 +37,91 @@ async function eventually(check: () => boolean | Promise<boolean>, description: 
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 }
+
+test("Pocket composes the opt-in core for a test smoke without replacing its served workflow runtime", async () => {
+	const coreDataDir = join(root, "core-smoke-data");
+	mkdirSync(coreDataDir, { recursive: true });
+	const openCoreApp = (kernel: ReturnType<typeof createWorkflowRuntimeKernel>) =>
+		PocketApp.open({
+			dataDir: coreDataDir,
+			defaultCwd: workingDirectory,
+			supervised: false,
+			log: () => {},
+			testExtensions: [kernel.extension],
+		});
+	let effectCalls = 0;
+	let stepCompleted = false;
+	const firstKernel = createWorkflowRuntimeKernel();
+	const smokeWorkflow = defineWorkflow({
+		id: "pocket.test.production-workflow-core-smoke",
+		version: 1,
+		async run({ step, signal }) {
+			const result = await step.do("smoke-effect", async () => {
+				effectCalls++;
+				return "durable-effect";
+			});
+			stepCompleted = true;
+			await new Promise<void>((resolve) => {
+				if (signal.aborted) return resolve();
+				signal.addEventListener("abort", () => resolve(), { once: true });
+			});
+			return result;
+		},
+	});
+	const firstApp = await openCoreApp(firstKernel);
+	app = firstApp;
+	const servedRuntime = firstApp.workflowEngine;
+	assert.ok(servedRuntime);
+	const firstEngine = firstKernel.createEngine(firstApp.harness);
+	try {
+		firstEngine.register(smokeWorkflow);
+		await firstEngine.open(BACKGROUND_CONTEXT);
+		const handle = await firstEngine.start(
+			smokeWorkflow,
+			{ smoke: true },
+			{ runId: "pocket-core-smoke" },
+			BACKGROUND_CONTEXT,
+		);
+		assert.equal(handle.runId, "pocket-core-smoke");
+		await eventually(() => stepCompleted, "the core step.do callback");
+		const running = await firstEngine.inspect(handle.runId, BACKGROUND_CONTEXT);
+		assert.equal(running.status, "running");
+		assert.equal(running.operations["smoke-effect"]?.status, "completed");
+		assert.equal(effectCalls, 1);
+		assert.equal(firstApp.workflowEngine, servedRuntime, "the smoke does not replace Pocket's current interpreter");
+
+		await firstEngine.stop(handle.runId, "smoke lifecycle stop", BACKGROUND_CONTEXT);
+		await assert.rejects(firstEngine.wait(handle.runId, BACKGROUND_CONTEXT), /stopped/);
+		const stopped = await firstEngine.inspect(handle.runId, BACKGROUND_CONTEXT);
+		assert.equal(stopped.status, "stopped");
+		assert.equal(stopped.operations["smoke-effect"]?.status, "completed");
+	} finally {
+		await firstEngine.close();
+		await firstApp.close();
+		if (app === firstApp) app = undefined;
+	}
+
+	const secondKernel = createWorkflowRuntimeKernel();
+	const secondApp = await openCoreApp(secondKernel);
+	app = secondApp;
+	const secondServedRuntime = secondApp.workflowEngine;
+	assert.ok(secondServedRuntime);
+	assert.notEqual(secondServedRuntime, servedRuntime, "reopen owns a fresh current interpreter");
+	const secondEngine = secondKernel.createEngine(secondApp.harness);
+	try {
+		secondEngine.register(smokeWorkflow);
+		await secondEngine.open(BACKGROUND_CONTEXT);
+		const recovered = await secondEngine.inspect("pocket-core-smoke", BACKGROUND_CONTEXT);
+		assert.equal(recovered.status, "stopped");
+		assert.equal(recovered.operations["smoke-effect"]?.status, "completed");
+		assert.equal(effectCalls, 1, "reopening Pocket must not repeat the completed step.do callback");
+		assert.equal(secondApp.workflowEngine, secondServedRuntime);
+	} finally {
+		await secondEngine.close();
+		await secondApp.close();
+		if (app === secondApp) app = undefined;
+	}
+});
 
 test("Pocket re-arms a parked workflow timer once per Harness and keeps it across extension reloads", async () => {
 	const registry = createRegistry();
