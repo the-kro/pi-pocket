@@ -1,5 +1,10 @@
 # Target 1 — production workflow runtime core implementation evidence
 
+> **Historical snapshot:** the status, test counts and limitations below describe the original Target 1
+> review, not the current checkout. Later commit `6a63f6b` added production waits/events and Pocket
+> core wiring. Statements below about absent Target 2/wiring and the then-known path-alias failure
+> are retained as historical evidence, not current status or freshly verified test results.
+
 > **Status: READY** for the opt-in Target 1 core only. It is not wired into Pocket production; the full Pocket suite retains one known, unrelated macOS path-alias failure.
 
 ## Scope and architecture

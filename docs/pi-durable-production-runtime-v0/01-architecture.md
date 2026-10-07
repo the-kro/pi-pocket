@@ -2,6 +2,36 @@
 
 ## Guiding principles
 
+### Host portability and earned integration seams
+
+Pi Pocket is the UI/host currently used for this runtime, not its execution authority. The same
+workflow and agent modules MUST be usable by Pi Durable hosts with a browser UI, a terminal UI
+(TUI), or no UI (programmatic execution), given the required extensions and configuration.
+This does not require building a new TUI now or treating unrelated UI plugin APIs as interchangeable.
+
+Use Pi Durable's standard extension facilities for Tasks, tools, sections, hooks and wraps, and its
+public Harness configuration for Models, environments and settings. Runtime correctness MUST NOT
+depend on PocketApp, PocketHost, browser state, Pocket settings paths, or its extension loader.
+
+A helper outside the Extension API earns its existence only when a spec requirement and a concrete
+public-API gap justify it. It MUST be a small exported, host-independent module that accepts host
+supplied dependencies. Recovery and lifetime helpers compose the existing Harness/workflow engine;
+they MUST NOT create a second scheduler, provider transport, cancellation tree or plugin lifecycle
+framework. Pocket may call these helpers as thin composition, as a TUI or programmatic host can.
+
+Every future runtime spec/plan MUST state:
+
+- which requirements use standard extensions/configuration;
+- for each additional helper: requirement → API gap → smallest portable interface → acceptance test;
+- the shared bootstrap/recovery/open/close order, Harness/resource ownership and startup-failure cleanup;
+- the minimal host integration, preserving existing options/callbacks and non-adapter behavior;
+- standalone public-export acceptance without Pocket imports/loader, and how the same sequence
+  applies to a TUI host.
+
+Static registration/configuration and ordinary reopen are the baseline. Hot reload is optional DX:
+current authority/definition drift still fails closed when definitions change, but no correctness
+rule may require a watcher or Pocket reload notification. Do not add a parallel legacy runtime path.
+
 ### Ordinary TypeScript owns orchestration
 
 Branching, loops, helper functions, conditions, and ordinary concurrency remain TypeScript.

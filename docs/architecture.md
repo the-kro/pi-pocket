@@ -2,6 +2,20 @@
 
 How Pi Pocket's parts depend on each other, and the orderings the code relies on. [map.md](map.md) says where things are; this says what to keep when changing them.
 
+## Portable runtime additions
+
+For the workflow/agent runtime being developed here, Pi Pocket is one UI/host over Pi Durable.
+New runtime semantics must also be usable by a TUI or programmatic host with the same extensions
+and configuration. Pocket-specific UI features remain Pocket-specific; this rule concerns shared
+runtime additions, not every app feature.
+
+Use standard extensions/public Harness options first. Additional recovery/configuration/lifetime
+helpers must justify their existence and be exported from host-independent runtime modules;
+`app.ts` may perform thin composition, not contain their agent policy. See the canonical
+[portability and future-planning rule](pi-durable-production-runtime-v0/01-architecture.md#host-portability-and-earned-integration-seams).
+The Target 3 helper is planned, not yet implemented. The existing upstream extension loader/hot
+reload remains optional DX for these modules; static registration must suffice.
+
 ## Durable truth and what memory keeps
 
 Pi Durable owns the lasting state of conversations: conversations, entries, tasks, and Pi Pocket's documents (`docs.ts`), in `pocket.sqlite`. People and settings, push subscriptions, uploads, and worktrees are files beside it ([map.md](map.md#data-pi-pocket-or-pi_pocket_dir)). What `PocketApp` keeps in memory about conversations is read back from storage:

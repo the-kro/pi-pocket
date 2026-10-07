@@ -28,6 +28,14 @@ We explicitly do **not** reproduce the DSH architecture on top of Pi.
 
 The useful architectural lesson retained from DSH is its semantic-history model, not its execution machinery.
 
+## Host portability
+
+Pi Pocket is one UI/host, not a runtime dependency. The same extensions and configured runtime
+must work in a Pi Durable TUI or programmatic host. Prefer standard extensions/public Harness
+configuration; any extra helper must earn its existence and be portable. Future specs/plans must
+follow [Host portability and earned integration seams](01-architecture.md#host-portability-and-earned-integration-seams).
+Hot reload is optional DX, not an execution prerequisite.
+
 ## Product goal
 
 Runtime v0 succeeds when it can reliably execute a real coding-agent workflow shaped approximately as:

@@ -4,6 +4,23 @@ This file defines the production v0 acceptance matrix.
 
 The long-term platform-independent conformance packet remains the larger source of future tests. Only the subset required by v0 is normative here.
 
+# Host portability
+
+Following [the architecture rule](01-architecture.md#host-portability-and-earned-integration-seams),
+prove the same configured runtime through thin Pocket composition and a standalone programmatic
+consumer using public exports, with no Pocket imports or loader. Document the identical bootstrap
+sequence for a Pi Durable TUI; implementing a new TUI is not required for v0.
+
+Must prove:
+
+- static registration/configuration and reopen work without watchers or hot reload;
+- extension definitions install before Harness.open; recovery/classification precedes uncertain
+  effects, with the selected portable preflight completed before scheduling/progress;
+- composed Models/env/options preserve non-adapter behavior and existing callbacks;
+- each Harness has isolated runtime resources/configuration, with explicit startup-failure cleanup;
+- runtime close releases its own resources before the caller-owned Harness closes;
+- changed authority/definitions fail closed whether detected after reopen or optional hot reload.
+
 # Runtime core
 
 Must prove:

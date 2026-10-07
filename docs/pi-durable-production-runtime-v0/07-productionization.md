@@ -150,6 +150,8 @@ This is the first product milestone.
 
 Before implementation begins, the Pi Durable agent must review this packet against the exact current Pi Durable source and report only concrete mismatches.
 
+Every runtime spec/plan must also apply [Host portability and earned integration seams](01-architecture.md#host-portability-and-earned-integration-seams): identify standard extension/configuration use, justify each extra exported helper with a requirement/API gap, state shared bootstrap and shutdown/failure ownership, and include a standalone public-export acceptance path applicable to TUI/programmatic hosts. Pocket must remain thin host composition. Loader/hot-reload enhancements are optional DX, never correctness prerequisites or speculative implementation tasks.
+
 Specifically verify:
 
 1. whether caller-reserved run admission can be atomically mapped to root Task creation;
