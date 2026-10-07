@@ -1,6 +1,8 @@
 # Target 3 — executable native agent-adapter plan
 
-Status: portability revision independently reviewed READY; not implementation/live acceptance.
+**Plan format:** crywolf-start-work/v1
+
+Status: portability revision independently reviewed READY; canonical task headings added in place without scope changes. Implementation/live acceptance is not claimed.
 Execution requires separate authorization. Fresh review details are recorded below.
 Contract: [target-3-agent-adapter-spec.md](target-3-agent-adapter-spec.md), requirements A1–A9,
 evidence E1–E9. Confirmed answer: “Confirmed — finish the spec and plan with that traceability”.
@@ -95,7 +97,28 @@ workflows retain their existing context and startup behavior.
 
 ## Ordered implementation tasks
 
-### T1 — Prove the portable per-Harness factory and fail-closed host seam
+## Task T1 — Prove the portable per-Harness factory and fail-closed host seam
+
+**Depends on:** none
+
+**Requirements:** A1,A5,A6,A9; E3–E5,E9.
+
+**Files:**
+
+- Create: packages/workflow-runtime/agents/profile.ts
+- Create: packages/workflow-runtime/agents/recovery.ts
+- Modify: packages/workflow-runtime/core/index.ts
+- Modify: packages/workflow-runtime/index.ts
+- Create: test/workflow-agent-host.test.ts
+
+**Acceptance:** A portable per-Harness runtime must fail closed until recovery is ready, gate both native model-entry paths, preserve generic Target 1/2 behavior, and compose host options without losing existing callbacks or non-adapter behavior.
+
+**Verification:**
+
+- Required: node --test test/workflow-agent-host.test.ts
+- Required: npm run check
+- Required: npm run lint
+- Required: npm test
 
 **Blocked by:** none (independent spec/plan review approval is the execution prerequisite).
 **Requirements/evidence:** A1,A5,A6,A9; E3–E5,E9. The semantic no-unknown-resend requirement
@@ -168,7 +191,27 @@ entrypoint, record exact signature/path and BLOCK that entrypoint (or Target 3 i
 is affected). No core patch, upgrade, widened scope or optimistic dispatch. This is a feasibility gate,
 not a choice to abandon A6.
 
-### T2 — Native one-shot tracer and exact workflow-owned continuation identity
+## Task T2 — Native one-shot tracer and exact workflow-owned continuation identity
+
+**Depends on:** T1
+
+**Requirements:** A1–A4,A9; E1,E2,E6,E9.
+
+**Files:**
+
+- Create: packages/workflow-runtime/agents/records.ts
+- Create: packages/workflow-runtime/agents/runner.ts
+- Modify: packages/workflow-runtime/core/index.ts
+- Create: test/workflow-agent-turn.test.ts
+
+**Acceptance:** Workflow-owned native turns are idempotent for matching intent, reject conflicting or drifted identities without dispatch, preserve exact native ownership/correlation across continuation, and drain admitted work before workflow terminality.
+
+**Verification:**
+
+- Required: node --test test/workflow-agent-turn.test.ts
+- Required: npm run check
+- Required: npm run lint
+- Required: npm test
 
 **Blocked by:** T1.
 **Requirements/evidence:** A1–A4,A9; E1,E2,E6,E9.
@@ -204,7 +247,28 @@ ownership and literal result/dispatch counts through public APIs, not internal h
 **Boundary:** no tool catalog, verdict schema, retry framework or caller migration beyond additive
 agent opt-in. Native submission dedupe is never used as proof of equal payload or safe delivery.
 
-### T3 — Complete-host no-resend recovery and exact native result reconciliation
+## Task T3 — Complete-host no-resend recovery and exact native result reconciliation
+
+**Depends on:** T2
+
+**Requirements:** A3–A6,A9; E2–E5.
+
+**Files:**
+
+- Modify: packages/workflow-runtime/agents/records.ts
+- Modify: packages/workflow-runtime/agents/recovery.ts
+- Modify: packages/workflow-runtime/agents/runner.ts
+- Create: test/workflow-agent-recovery.test.ts
+- Create: test/fixtures/workflow-agent-crash-worker.ts
+
+**Acceptance:** Complete-process kill/reopen tests must replay only exact completed results, durably fence uncertain dispatches before native abort marking, and keep cumulative external dispatch markers unchanged across ambiguous crash boundaries.
+
+**Verification:**
+
+- Required: node --test test/workflow-agent-recovery.test.ts
+- Required: npm run check
+- Required: npm run lint
+- Required: npm test
 
 **Blocked by:** T2.
 **Requirements/evidence:** A3–A6,A9; E2–E5.
@@ -243,7 +307,27 @@ not proof of agent behavior. No live network needed.
 **Boundary:** no startup polling service, delivery lease, scheduler patch, generic retry chain or blind
 request replay. Startup fence solves installed no-resend gap, not arbitrary distributed exactly-once.
 
-### T4 — Prove monotonic authority at actual execute and every new provider round
+## Task T4 — Prove monotonic authority at actual execute and every new provider round
+
+**Depends on:** T2
+
+**Requirements:** A2,A3,A6,A9; E5,E6.
+
+**Files:**
+
+- Modify: packages/workflow-runtime/agents/profile.ts
+- Modify: packages/workflow-runtime/agents/runner.ts
+- Modify: packages/workflow-runtime/agents/recovery.ts
+- Create: test/workflow-agent-authority.test.ts
+
+**Acceptance:** Current persisted authority and manifest identity must be enforced at actual tool execution and every new provider round, including replay and nested paths; revoked or drifted authority produces no unauthorized mutation or provider dispatch.
+
+**Verification:**
+
+- Required: node --test test/workflow-agent-authority.test.ts
+- Required: npm run check
+- Required: npm run lint
+- Required: npm test
 
 **Blocked by:** T2.
 **Requirements/evidence:** A2,A3,A6,A9; E5,E6.
@@ -277,7 +361,29 @@ markers after drift. Prompts/tool lists alone are not proof.
 **Boundary:** explicit deployment-version discipline is required; no speculative source hashing or
 untrusted-extension sandbox. Host operators remain trusted. Unsupported tool mechanisms stay off.
 
-### T5 — Schema-bound sole-result tool with exact native settlement promotion
+## Task T5 — Schema-bound sole-result tool with exact native settlement promotion
+
+**Depends on:** T2
+
+**Requirements:** A3–A5,A7; E2,E3,E6,E7.
+
+**Files:**
+
+- Create: packages/workflow-runtime/agents/structured-result.ts
+- Modify: packages/workflow-runtime/agents/records.ts
+- Modify: packages/workflow-runtime/agents/runner.ts
+- Modify: packages/workflow-runtime/agents/recovery.ts
+- Modify: test/fixtures/workflow-agent-crash-worker.ts
+- Create: test/workflow-agent-result.test.ts
+
+**Acceptance:** Structured success is promoted only from the exact schema-bound sole result call after matching native submission settlement and completed tool evidence; invalid, mixed, stale, nested, or mismatched results never become success.
+
+**Verification:**
+
+- Required: node --test test/workflow-agent-result.test.ts
+- Required: npm run check
+- Required: npm run lint
+- Required: npm test
 
 **Blocked by:** T2.
 **Requirements/evidence:** A3–A5,A7; E2,E3,E6,E7.
@@ -309,7 +415,29 @@ native settlement reference chain, not merely candidate existence or terminate:t
 **Boundary:** one concrete schema-bound adapter, no generalized result service, verdict policy,
 revision binding or provider responseFormat invention.
 
-### T6 — Selected terminality closes thread admission before observable native cleanup
+## Task T6 — Selected terminality closes thread admission before observable native cleanup
+
+**Depends on:** T2
+
+**Requirements:** A1,A4,A8,A9; E1,E8.
+
+**Files:**
+
+- Modify: packages/workflow-runtime/agents/records.ts
+- Modify: packages/workflow-runtime/agents/runner.ts
+- Modify: packages/workflow-runtime/agents/recovery.ts
+- Modify: packages/workflow-runtime/core/index.ts
+- Modify: test/fixtures/workflow-agent-crash-worker.ts
+- Create: test/workflow-agent-cleanup.test.ts
+
+**Acceptance:** Selected terminality closes thread admission before observable native cleanup; stopped outcomes remain authoritative, cleanup failures stay inspectable, and reopen retries cleanup without resurrecting agent work.
+
+**Verification:**
+
+- Required: node --test test/workflow-agent-cleanup.test.ts
+- Required: npm run check
+- Required: npm run lint
+- Required: npm test
 
 **Blocked by:** T2.
 **Requirements/evidence:** A1,A4,A8,A9; E1,E8.
@@ -338,7 +466,30 @@ outcome after reopen. Preserve existing stop/reservation/terminal competition re
 **Boundary:** no custom child registry, new cancellation scheduler or swallowed cleanup errors. Public
 abort marking during preflight is allowed; any wait that enables scheduling occurs only after fencing.
 
-### T7 — Thin Pocket composition, exported standalone consumer and static-host acceptance
+## Task T7 — Thin Pocket composition, exported standalone consumer and static-host acceptance
+
+**Depends on:** T3, T4, T5, T6
+
+**Requirements:** A1–A9; E9 plus acceptance from all previous tasks.
+
+**Files:**
+
+- Modify: packages/workflow-runtime/index.ts
+- Modify: src/server/extensions/workflows.ts
+- Modify: src/server/app.ts
+- Modify: test/workflow-runtime-app.test.ts
+- Modify: test/workflow-agent-host.test.ts
+- Create: docs/workflow-runtime-agent-standalone.md
+
+**Acceptance:** The portable factory is used by both standalone and Pocket hosts with the same lifecycle order, clean borrowed-Harness ownership, unchanged generic/legacy stored data behavior, and no loader changes; all offline agent acceptance tests and repository checks pass.
+
+**Verification:**
+
+- Required: node --test test/workflow-runtime-app.test.ts test/workflow-agent-host.test.ts
+- Required: npm run check
+- Required: npm run lint
+- Required: npm test
+- Required: npm run format:check
 
 **Blocked by:** T3, T4, T5, T6.
 **Requirements/evidence:** A1–A9; E9 plus acceptance from all previous tasks.
