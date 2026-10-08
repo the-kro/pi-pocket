@@ -2,8 +2,7 @@
 
 **Plan format:** crywolf-start-work/v1
 
-Status: portability revision was independently reviewed READY; the provider-retry contract is now explicitly revised by the user. T3 implementation remains in progress; no implementation/live acceptance is claimed.
-Direct salvage is user-authorized after orchestration failure; no durable workflow receipt is claimed. Fresh implementation review remains required.
+Status: Target 3 offline implementation is complete and user-approved after independent review (CodeReviewer READY; Oracle ADVISED with no concrete blocker). The implementation was committed as `2c82c53`; the organization-only host/recovery extraction is complete and remains uncommitted for review. No durable workflow receipt or live-provider acceptance is claimed. The latest full repository run passed 341/342 tests; the sole failure is the known browser test at `test/browser.test.ts:659` (`204 !== 200`).
 Contract: [target-3-agent-adapter-spec.md](target-3-agent-adapter-spec.md), requirements A1–A9,
 evidence E1–E9. The prior confirmed scope and the latest semantic revision are recorded in that contract.
 The full exact scope question/answer and tentative-approval qualification are recorded in that contract.
@@ -16,13 +15,11 @@ That portability revision's fresh READY is historical document review, not imple
 
 ## Boundaries and prerequisites
 
-This is direct salvage after orchestration failure, authorized for implementation without a durable workflow receipt. The companion
-contract and canonical portability policy remain the governing constraints;
+This implementation was directly salvaged after orchestration failure and user-approved; no durable workflow receipt was created. Commit `2c82c53` records that implementation. The current host/recovery extraction is a separate, uncommitted organizational refactor. The companion contract and canonical portability policy remain the governing constraints;
 [the architecture rule](../pi-durable-production-runtime-v0/01-architecture.md#host-portability-and-earned-integration-seams)
-guides this plan and future runtime plans. Do not run planner/workflow launchers, repair the planner
-framework, install/upgrade, restart, commit or make live calls.
+guides this plan and future runtime plans. No planner repair, dependency install/upgrade, restart, or live-provider call is authorized by this record.
 
-Future implementation must preserve current Targets 1/2 in `packages/workflow-runtime/core/index.ts`.
+The implementation preserves current Targets 1/2 in `packages/workflow-runtime/core/index.ts`.
 Use installed Durable 1.0.2 public exports; `node_modules/.../dist` internals are inspection evidence,
 not import seams. Root `packages/workflow-runtime/index.ts` exports core and shared kernel;
 `src/server/extensions/workflows.ts` registers its native Task before Harness.open; Pocket owns its
@@ -53,10 +50,11 @@ npm test
 
 Use focused `node --test test/<named-file>.test.ts` runs below first. After future source edits, apply
 repository formatting and rerun checks; inspect the formatting diff to avoid unrelated edits. For a
-live Pocket host, server changes require a later operator restart, never during a tool call. This docs
-attempt does not perform that restart. No web changes are planned.
+live Pocket host, server changes require a later operator restart, never during a tool call. The T3
+runtime and this host/recovery extraction do not edit `src/server/**`; no restart is needed or was
+performed. No web changes are planned.
 
-## Repository anchors and proposed files
+## Repository anchors and module layout
 
 Current anchors:
 
@@ -68,29 +66,32 @@ Current anchors:
 - `packages/workflow-runtime/index.ts`: root exports and shared workflowRuntimeKernel.
 - `src/server/app.ts:333–420`: loader.loadAll, Harness.open, #recover, subscriptions, engine.open.
   `PocketApp.close` remains the lifecycle authority; preserve current engine-before-Harness close.
-- `src/server/extensions/workflows.ts`: required native definition registration. Existing upstream
-  `src/server/reload.ts` is optional host DX; this branch adds workflows ORDER/REQUIRED/TITLES
-  entries only. No loader changes are planned or authorized. Do not use optional Guard/plan extension
-  as the deployment floor.
+- `src/server/extensions/workflows.ts`: currently registers the shared workflow Task. T7 will
+  replace that registration with the portable runtime extension for an agent-enabled host; the
+  extension loader itself remains unchanged. Existing upstream `src/server/reload.ts` is optional
+  host DX. Do not use optional Guard/plan extension as the deployment floor.
 - `test/workflow-runtime-core.test.ts:122,192`: child-process spawn and SIGKILL pattern;
   `test/fixtures/workflow-runtime-core-crash-worker.ts`: reusable storage-boundary worker pattern.
 - `test/workflow-runtime-app.test.ts`, `workflow-runtime-integration.test.ts`,
   `workflow-test-support.ts`, `helpers.ts`: current host and scripted-model fixture seams.
 
-New cohesive modules under `packages/workflow-runtime/agents/`: profile.ts (effective authority),
-records.ts (identity/semantic correlation), recovery.ts (preflight and dispatch composition),
-structured-result.ts (one result tool), runner.ts (native Task and workflow binding). No module is
+Cohesive modules under `packages/workflow-runtime/agents/`: profile.ts (profile and identity),
+records.ts (durable correlation), host.ts (runtime composition and controlled Harness lifecycle),
+recovery.ts (paused-start reconciliation), runner.ts (native Task and workflow binding), and
+structured-result.ts (one result tool, when implemented). No module is
 mandatory merely to meet a file count: keep cohesive helpers together. Root public adapter exports
 are additive. Agent code must not import PocketHost, PocketApp, UI, settings paths, reload notifications
 or server extension implementations. Standard Extension tasks/tools/sections/hooks/wraps are the
 first choice; external helpers earn their existence only through the evidenced API gaps below.
 
-New tests: `test/workflow-agent-{host,turn,recovery,authority,result,cleanup}.test.ts`,
-`test/fixtures/workflow-agent-crash-worker.ts`; actual Pocket lifecycle coverage also belongs in
-`test/workflow-runtime-app.test.ts`. All match the existing `npm test` glob.
+Added tests: `test/workflow-agent-{host,turn,recovery}.test.ts` and
+`test/fixtures/workflow-agent-crash-worker.ts`. Planned for T4–T6: authority, result, and cleanup
+suites; actual Pocket lifecycle coverage belongs in `test/workflow-runtime-app.test.ts`. All match
+the existing `npm test` glob.
 
-New stored kinds are specified once in the contract: native `pocket.workflow-runtime.agent-runner`
-v1 and session doc family `pocket.workflow-runtime.agent-thread` v1. Preserve existing
+The implementation adds the stored kinds specified by the contract: native
+`pocket.workflow-runtime.agent-runner` v1 and session doc family
+`pocket.workflow-runtime.agent-thread` v1. Preserve existing
 `pocket.workflow-runtime.{task,run,event}`. Absent agent records require no migration; unsupported
 agent versions fail closed and remain inspectable. Agent-enabled workflows opt in additively; generic
 workflows retain their existing context and startup behavior.
@@ -106,6 +107,7 @@ workflows retain their existing context and startup behavior.
 **Files:**
 
 - Create: packages/workflow-runtime/agents/profile.ts
+- Create: packages/workflow-runtime/agents/host.ts
 - Create: packages/workflow-runtime/agents/recovery.ts
 - Modify: packages/workflow-runtime/core/index.ts
 - Modify: packages/workflow-runtime/index.ts
@@ -122,9 +124,10 @@ workflows retain their existing context and startup behavior.
 
 **Blocked by:** none (independent spec/plan review approval is the execution prerequisite).
 **Requirements/evidence:** A1,A5,A9; E3,E9. Attach-before-progress remains required for adapter recovery and tool-state inspection. Provider generation/compaction/deferred requests use standard Pi Durable recovery semantics; there is no Models runtime gate or public identity-seam proof requirement. E9 maps host bootstrap to the portable helper, not an app.ts inspection algorithm.
-**Targets:** agents/recovery.ts and profile.ts plus one cohesive runtime factory module if necessary;
-core createWorkflowRuntimeKernel/WorkflowContext/createWorkflowTask binding seam; root exports;
-`workflow-agent-host.test.ts`. Names/interfaces below are proposed, not shipped; finalize in this proof.
+**Targets:** agents/host.ts for the portable factory, controlled lifecycle and Harness-option composition;
+agents/recovery.ts for paused-start reconciliation; profile.ts for profile/environment identity; core
+createWorkflowRuntimeKernel/WorkflowContext/createWorkflowTask binding seam; root exports;
+`workflow-agent-host.test.ts`.
 
 1. At the adapter host boundary, RED: engine and progress-capable methods must remain unavailable
    until controlled host startup completes; a generic Target 1/2 kernel still opens unchanged. Use
@@ -334,6 +337,7 @@ exactly-once provider guarantee is claimed. Tool-effect uncertainty remains sepa
 
 - Modify: packages/workflow-runtime/agents/profile.ts
 - Modify: packages/workflow-runtime/agents/runner.ts
+- Modify: packages/workflow-runtime/agents/host.ts
 - Modify: packages/workflow-runtime/agents/recovery.ts
 - Create: test/workflow-agent-authority.test.ts
 
@@ -348,8 +352,9 @@ exactly-once provider guarantee is claimed. Tool-effect uncertainty remains sepa
 
 **Blocked by:** T2.
 **Requirements/evidence:** A2,A3,A6,A9; E6.
-**Targets:** agents/profile.ts, final guarded tool registration/composition in runner.ts/recovery.ts;
-public env adapters; `workflow-agent-authority.test.ts`.
+**Targets:** agents/profile.ts and runner.ts for final tool-execution guards; host.ts for effective
+manifest/tool composition; recovery.ts for startup authority reconciliation; public env adapters;
+`workflow-agent-authority.test.ts`.
 
 1. RED/GREEN effective floor ∩ profile ∩ call narrowing with explicit audited tools/sections/extensions,
    schema and implementation versions/order. Missing, duplicate-name, unexpectedly replaced or
@@ -389,6 +394,7 @@ untrusted-extension sandbox. Host operators remain trusted. Unsupported tool mec
 - Create: packages/workflow-runtime/agents/structured-result.ts
 - Modify: packages/workflow-runtime/agents/records.ts
 - Modify: packages/workflow-runtime/agents/runner.ts
+- Modify: packages/workflow-runtime/agents/host.ts
 - Modify: packages/workflow-runtime/agents/recovery.ts
 - Modify: test/fixtures/workflow-agent-crash-worker.ts
 - Create: test/workflow-agent-result.test.ts
@@ -404,7 +410,7 @@ untrusted-extension sandbox. Host operators remain trusted. Unsupported tool mec
 
 **Blocked by:** T2.
 **Requirements/evidence:** A3–A5,A7; E2,E3,E6,E7.
-**Targets:** agents/{structured-result,records,runner,recovery}.ts;
+**Targets:** agents/{structured-result,records,runner,host,recovery}.ts;
 `workflow-agent-result.test.ts`, crash worker.
 
 1. RED/GREEN a literal simple fixture schema (not ReviewResult) delivered by the sole direct native
@@ -664,9 +670,11 @@ If an essential gate cannot be implemented with installed public APIs, stop with
 The approved provider-retry semantics are a user-authorized contract revision, not an improvised
 fallback; further material contract changes still require user approval.
 
-## Historical authorship verification and independent-review handoff
+## Historical docs-only authorship record (pre-implementation)
 
-Preflight found no `docs/plans/` directory, so there were no existing assigned artifacts to overwrite or
+The notes below describe the original planning-document authoring attempt only; they are not the
+current implementation or verification status, which is summarized at the top of this plan.
+Preflight at that time found no `docs/plans/` directory, so there were no existing assigned artifacts to overwrite or
 reconcile. The authoritative packet, current core/root exports/Pocket bootstrap, installed 1.0.2
 exports and relevant generation/submission/tool/agent/scheduler/provider/compaction sources were
 read. The full authored files were reread after writing. Only these changed paths are assigned:
@@ -677,12 +685,12 @@ docs/plans/target-3-agent-adapter-plan.md
 ```
 
 No source, runtime, planner, dependency or stored-data changes; no tests/live provider calls were run
-for prose authorship. Git diff/whitespace commands were **not run**: this attempt has no shell tool
-and VCS operations are outside its mutation boundary. Do not report their results as clean. Future
-independent review should inspect the exact two-path diff and run `git diff --check` / formatting
-checks if authorized; untracked additions require viewing their content as well as git diff. A direct
-content grep across both assigned files found no trailing spaces/tabs or merge-conflict markers;
-this is a limited text check, not a git diff or formatter result.
+for that prose-only attempt. Git diff/whitespace commands were **not run** because it had no shell
+and VCS operations were outside its mutation boundary; no clean-diff claim was made. The handoff
+asked a later independent reviewer to inspect the exact two-path diff and run `git diff --check` /
+formatting checks if authorized; untracked additions required content inspection as well as git diff.
+A direct content grep across those documents found no trailing spaces/tabs or merge-conflict markers;
+that was a limited text check, not a git diff or formatter result.
 
 ## Historical independent review — pre-portability revision only
 

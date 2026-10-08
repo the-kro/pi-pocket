@@ -25,7 +25,7 @@ import {
     createWorkflowAgentRuntime,
     type AgentThreadRecord,
     type WorkflowAgentHostSetup,
-} from "../../packages/workflow-runtime/agents/recovery.ts";
+} from "../../packages/workflow-runtime/index.ts";
 import { workflowAgentThreadKey } from "../../packages/workflow-runtime/agents/profile.ts";
 import {
     defineWorkflow,

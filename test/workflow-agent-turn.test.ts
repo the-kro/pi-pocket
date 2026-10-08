@@ -16,7 +16,7 @@ import {
     AGENT_RUNNER_TASK_NAME,
     AGENT_THREAD_DOC,
     createWorkflowAgentRuntime,
-} from "../packages/workflow-runtime/agents/recovery.ts";
+} from "../packages/workflow-runtime/index.ts";
 import {
     workflowAgentModelIdentityFingerprint,
     workflowAgentModelIdentityInputs,

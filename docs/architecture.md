@@ -13,9 +13,10 @@ Use standard extensions/public Harness options first. Additional recovery/config
 helpers must justify their existence and be exported from host-independent runtime modules;
 `app.ts` may perform thin composition, not contain their agent policy. See the canonical
 [portability and future-planning rule](pi-durable-production-runtime-v0/01-architecture.md#host-portability-and-earned-integration-seams).
-The Target 3 agent-adapter runtime is implemented under `packages/workflow-runtime/`, with a
-controlled `openHost()` lifecycle. Pocket's app-level composition of that runtime remains a
-separate integration step. The existing upstream extension loader/hot reload remains optional DX
+The Target 3 agent-adapter runtime is implemented under `packages/workflow-runtime/`:
+`agents/host.ts` owns runtime composition and the controlled `openHost()` lifecycle, while
+`agents/recovery.ts` owns paused-start reconciliation. Pocket's app-level composition of that
+runtime remains a separate integration step. The existing upstream extension loader/hot reload remains optional DX
 for these modules; static registration must suffice.
 
 ## Durable truth and what memory keeps

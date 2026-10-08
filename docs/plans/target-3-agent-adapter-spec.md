@@ -1,7 +1,6 @@
 # Target 3 — native agent adapter: Spec Contract
 
-Status: portability refinement independently reviewed READY. This is document readiness, not implementation or live-provider acceptance.
-Implementation is authorized only through the user's later direct-salvage instruction; no durable workflow receipt is claimed. Target 3 acceptance remains pending, and no live-provider acceptance has been demonstrated. Companion: [implementation plan](target-3-agent-adapter-plan.md).
+Status: Target 3 offline implementation was independently reviewed (CodeReviewer READY; Oracle ADVISED with no concrete blocker) and accepted by the user. No durable workflow receipt or live-provider acceptance is claimed; the live-provider gate remains separate. After the organization-only host/recovery extraction, the latest full repository run passed 341/342 tests; the sole failure is the known browser test at `test/browser.test.ts:659` (`204 !== 200`). Focused agent suites passed. Companion: [implementation plan](target-3-agent-adapter-plan.md).
 
 ## 1. Approval and authority
 
@@ -207,7 +206,7 @@ import them. Package metadata confirms 1.0.2 and export surface in `D/index.d.ts
 
 ## 4. Minimal durable vocabulary and seam
 
-### Portable composition interface (implemented; Target 3 acceptance pending review)
+### Portable composition interface (implemented and user-accepted for offline Target 3)
 
 One factory, `createWorkflowAgentRuntime({harnessOptions, agentConfig, timerOptions})`, returns a
 standard extension, bounded workflow registration, ready-only engine access, controlled `openHost`

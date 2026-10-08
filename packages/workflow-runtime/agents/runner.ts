@@ -37,10 +37,10 @@ import {
 import {
     AGENT_RUNNER_TASK_NAME,
     AGENT_THREAD_DOC,
+    WorkflowAgentAdmissionError,
     type AgentThreadRecord,
     type AgentTurnRecord,
 } from "./records.ts";
-import { WorkflowAgentAdmissionError } from "./recovery.ts";
 
 export type WorkflowAgentTurnInput = {
     readonly threadId: string;

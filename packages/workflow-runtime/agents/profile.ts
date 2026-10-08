@@ -106,10 +106,14 @@ export function workflowAgentProviderSessionId(identity: AgentThreadIdentity): s
     return `${PROVIDER_SESSION_PREFIX}${workflowAgentThreadKey(identity)}`;
 }
 
+export function hasWorkflowAgentProviderSessionIdPrefix(sessionId: string): boolean {
+    return sessionId.startsWith(PROVIDER_SESSION_PREFIX);
+}
+
 export function parseWorkflowAgentProviderSessionId(
     sessionId: string,
 ): { readonly key: string; readonly identity: AgentThreadIdentity } | undefined {
-    if (!sessionId.startsWith(PROVIDER_SESSION_PREFIX)) {
+    if (!hasWorkflowAgentProviderSessionIdPrefix(sessionId)) {
         return undefined;
     }
 
