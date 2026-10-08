@@ -6,9 +6,12 @@ import {
     defineEntry,
     defineExtension,
     defineTask,
+    type AnyTask,
+    type ConversationId,
     type Harness,
     type NextTaskState,
     type RunningTask,
+    type SettledTask,
     type TaskId,
     type TaskRuntime,
     type Tx,
@@ -56,10 +59,26 @@ export type WorkflowStep = {
         options?: StepDoOptions<T>,
     ): Promise<T>;
 };
+export type WorkflowAgentTurnBinding = {
+    readonly runId: string;
+    readonly taskId: TaskId;
+    readonly conversationId: ConversationId;
+    readonly signal: AbortSignal;
+    commit<T>(change: (tx: Tx) => T | Promise<T>): Promise<T>;
+    waitForTask<T>(id: TaskId<T>): Promise<SettledTask<T>>;
+};
+export type WorkflowAgentTurnHandler = (input: JsonValue) => JsonValue | Promise<JsonValue>;
+export type WorkflowAgentTurnBinder = (
+    binding: WorkflowAgentTurnBinding,
+) => WorkflowAgentTurnHandler;
+export type WorkflowAgentContext = {
+    turn(input: JsonValue): Promise<JsonValue>;
+};
 export type WorkflowContext<I extends JsonValue> = {
     readonly input: I;
     readonly step: WorkflowStep;
     readonly signal: AbortSignal;
+    readonly agent?: WorkflowAgentContext;
 };
 export type WorkflowDefinition<I extends JsonValue = JsonValue, O extends JsonValue = JsonValue> = {
     readonly id: string;
@@ -1612,7 +1631,11 @@ function makeWorkflowStep(
 
 type TaskResult = JsonValue;
 
-function createWorkflowTask(definitions: DefinitionRegistry, stopFailures: StopFailures) {
+function createWorkflowTask(
+    definitions: DefinitionRegistry,
+    stopFailures: StopFailures,
+    bindAgentTurn?: WorkflowAgentTurnBinder,
+) {
     // Existing durable Tasks store this kind; changing it would require a migration, not a namespace cleanup.
     return defineTask<WorkflowTaskInput, WorkflowCheckpoint, TaskResult>({
         name: "pocket.workflow-runtime.task",
@@ -1675,11 +1698,41 @@ function createWorkflowTask(definitions: DefinitionRegistry, stopFailures: StopF
                 let failed = false;
 
                 try {
+                    const agentTurn = bindAgentTurn?.({
+                        runId: task.input.runId,
+                        taskId: runtime.taskId,
+                        conversationId: runtime.conversationId,
+                        signal,
+                        commit: async <T>(change: (tx: Tx) => T | Promise<T>): Promise<T> => {
+                            let result: T;
+
+                            await runtime.commit(async (tx) => {
+                                result = await change(tx);
+
+                                return undefined;
+                            }, context);
+
+                            return result!;
+                        },
+                        waitForTask: <T>(id: TaskId<T>): Promise<SettledTask<T>> =>
+                            runtime.waitForTask(id, context),
+                    });
+                    const agent =
+                        agentTurn === undefined
+                            ? undefined
+                            : {
+                                  turn: (input: JsonValue) =>
+                                      effects!.track(async () =>
+                                          copyJson(await agentTurn(freezeJson(input))),
+                                      ),
+                              };
+
                     result = copyJson(
                         await definition.run({
                             input: freezeJson(task.input.input) as never,
                             step,
                             signal,
+                            ...(agent === undefined ? {} : { agent }),
                         }),
                     );
                 } catch (error) {
@@ -1728,21 +1781,41 @@ export const workflowRuntimeExtension = defineExtension({
     tasks: [WorkflowRuntimeTask],
 });
 
+export type WorkflowRuntimeOpenGate = (context: Context) => void | Promise<void>;
+export type WorkflowRuntimeKernelOptions = {
+    readonly beforeOpen?: WorkflowRuntimeOpenGate;
+    /** Runs after TimerHost initialization and compatible activation, immediately before progress. */
+    readonly beforeResume?: WorkflowRuntimeOpenGate;
+    /** Runs at the controlled progress transition; it may initiate native cancellation operations. */
+    readonly beforeProgress?: WorkflowRuntimeOpenGate;
+    readonly bindAgentTurn?: WorkflowAgentTurnBinder;
+    readonly additionalTasks?: readonly AnyTask[];
+};
+
 /** Create an isolated definition registry and native Task handler for one host. */
-export function createWorkflowRuntimeKernel() {
+export function createWorkflowRuntimeKernel(options: WorkflowRuntimeKernelOptions = {}) {
     const registry: DefinitionRegistry = new Map();
     const stopFailures = new StopFailures();
-    const task = createWorkflowTask(registry, stopFailures);
+    const task = createWorkflowTask(registry, stopFailures, options.bindAgentTurn);
     const extension = defineExtension({
         name: "workflow-runtime-core",
-        tasks: [task],
+        tasks: [task, ...(options.additionalTasks ?? [])],
     });
 
     return {
         task,
         extension,
         createEngine: (harness: Harness, timerOptions?: WorkflowTimerOptions) =>
-            new WorkflowEngine(harness, registry, task, stopFailures, timerOptions),
+            new WorkflowEngine(
+                harness,
+                registry,
+                task,
+                stopFailures,
+                timerOptions,
+                options.beforeOpen,
+                options.beforeResume,
+                options.beforeProgress,
+            ),
     };
 }
 
@@ -1755,6 +1828,9 @@ export class WorkflowEngine {
     readonly #stopWaiters = new Set<(error: Error) => void>();
     #opened = false;
     #closed = false;
+    readonly #beforeOpen: WorkflowRuntimeOpenGate | undefined;
+    readonly #beforeResume: WorkflowRuntimeOpenGate | undefined;
+    readonly #beforeProgress: WorkflowRuntimeOpenGate | undefined;
 
     constructor(
         harness: Harness,
@@ -1768,6 +1844,9 @@ export class WorkflowEngine {
                 return () => clearTimeout(timer);
             },
         },
+        beforeOpen?: WorkflowRuntimeOpenGate,
+        beforeResume?: WorkflowRuntimeOpenGate,
+        beforeProgress?: WorkflowRuntimeOpenGate,
     ) {
         this.#harness = harness;
         this.#timerHost = new WorkflowTimerHost(
@@ -1786,6 +1865,9 @@ export class WorkflowEngine {
         this.#definitions = registry;
         this.#task = task;
         this.#stopFailures = stopFailures;
+        this.#beforeOpen = beforeOpen;
+        this.#beforeResume = beforeResume;
+        this.#beforeProgress = beforeProgress;
     }
 
     register<I extends JsonValue, O extends JsonValue>(definition: WorkflowDefinition<I, O>): void {
@@ -1809,10 +1891,33 @@ export class WorkflowEngine {
             throw new Error("WorkflowEngine is closed");
         }
 
-        this.#opened = true;
+        await this.#beforeOpen?.(context);
+
+        if (this.#closed) {
+            throw new Error("WorkflowEngine is closed");
+        }
+
         await this.#timerHost.open(context);
-        this.#harness.resume();
+
+        if (this.#closed) {
+            throw new Error("WorkflowEngine is closed");
+        }
+
         await this.#activateCompatible(context);
+        await this.#beforeResume?.(context);
+
+        if (this.#closed) {
+            throw new Error("WorkflowEngine is closed");
+        }
+
+        this.#opened = true;
+        await this.#beforeProgress?.(context);
+
+        if (this.#closed) {
+            throw new Error("WorkflowEngine is closed");
+        }
+
+        this.#harness.resume();
     }
 
     async start<I extends JsonValue, O extends JsonValue>(

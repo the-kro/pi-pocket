@@ -3859,3 +3859,56 @@ test("same compatible version reactivates a parked run on two separate hosts", a
         await third.harness.close(context);
     }
 });
+
+test("open runs final readiness and controlled cancellation before scheduling resumes", async () => {
+    const registry = createRegistry();
+    const events: string[] = [];
+    let harness!: Harness;
+
+    let startWorkflow: () => Promise<void> = async () => {};
+
+    const kernel = core!.createWorkflowRuntimeKernel({
+        beforeOpen: () => {
+            events.push("before-open");
+        },
+        beforeResume: () => {
+            events.push("before-resume");
+        },
+        beforeProgress: async () => {
+            events.push("before-progress");
+            assert.equal((await harness.inspect(context)).scheduling, "paused");
+            await startWorkflow();
+        },
+    });
+
+    registry.install(kernel.extension);
+    harness = await Harness.open(
+        new MemoryStorage(),
+        { models: createModels(), registry },
+        context,
+    );
+    const engine = kernel.createEngine(harness);
+
+    startWorkflow = async () => {
+        await engine.start(
+            core!.defineWorkflow({
+                id: "core.before-progress",
+                version: 1,
+                run: () => "started",
+            }),
+            null,
+            { runId: "core-before-progress" },
+            context,
+        );
+    };
+
+    try {
+        await engine.open(context);
+        assert.deepEqual(events, ["before-open", "before-resume", "before-progress"]);
+        assert.equal((await harness.inspect(context)).scheduling, "running");
+        assert.equal(await engine.wait("core-before-progress", context), "started");
+    } finally {
+        await engine.close();
+        await harness.close(context);
+    }
+});

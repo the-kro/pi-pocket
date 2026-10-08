@@ -1,6 +1,8 @@
 import { createWorkflowRuntimeKernel } from "./core/index.ts";
 
 export * from "./core/index.ts";
+export * from "./agents/profile.ts";
+export * from "./agents/recovery.ts";
 export { InvocationCoordinator } from "./invocation.ts";
 export { WorkflowTimerHost } from "./timer-host.ts";
 export type { WorkflowTimerOptions } from "./timer-host.ts";

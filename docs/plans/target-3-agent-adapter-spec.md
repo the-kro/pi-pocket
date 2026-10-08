@@ -1,10 +1,7 @@
 # Target 3 — native agent adapter: Spec Contract
 
-Status: portability refinement independently reviewed READY. Execution requires separate authorization.
-Fresh reviewer `8edad509-8274-4453-8967-dd6d3ba4053a` reviewed the complete revised documentation;
-this verdict is document readiness, not implementation or live-provider acceptance.
-Implementation is not authorized by this document-writing attempt. No live provider acceptance has
-been demonstrated. Companion: [implementation plan](target-3-agent-adapter-plan.md).
+Status: portability refinement independently reviewed READY. This is document readiness, not implementation or live-provider acceptance.
+Implementation is authorized only through the user's later direct-salvage instruction; no durable workflow receipt is claimed. Target 3 acceptance remains pending, and no live-provider acceptance has been demonstrated. Companion: [implementation plan](target-3-agent-adapter-plan.md).
 
 ## 1. Approval and authority
 
@@ -16,21 +13,32 @@ Exact answer:
 
 > Confirmed — finish the spec and plan with that traceability
 
-This supersedes tentative approval only as confirmation of the stated scope. The earlier requirement
-to prove adapter necessity remains binding. In particular, startup preflight is a proposed mechanism,
-not a mechanism literally named by the original packet. Preventing unknown resend is essential to the
-crash contract, **not** merely to a happy-path one-shot conversation. Eager preflight is the selected,
-smallest source-supported mechanism; a comprehensive lazy effect fence is not logically impossible,
-but is not proved here and is not the selected implementation.
+This was the original scope approval. Its no-blind-provider-resend and per-round Models-gate clauses are superseded by the approved revision below. The earlier requirement to prove adapter necessity remains historical context; startup preflight remains a selected host-lifecycle mechanism, not a mechanism literally named by the original packet.
 
-The user subsequently approved the portable-host refinement and documentation changes:
+### Approved semantic revision
+
+The user later approved relaxing the provider no-blind-resend requirement to match standard Pi Durable recovery behavior:
+
+> I think we should relax the spec requirement as you suggested. it aligns with standard pi-durable behavior.
+
+Effective contract:
+
+- A provider request whose delivery or response is uncertain after a crash may be issued again when Pi Durable resumes its native generation, compaction, or deferred-poll task. Do not promise exactly-once provider calls, duplicate-charge prevention, or identical output after recovery.
+- Continue replaying an exactly saved completed result without another provider request.
+- Keep exact workflow/run/thread/turn ownership and immutable-intent checks at adapter turn admission. Recovery preflight must also verify the workflow owner/run is still active, un-aborted and non-terminal before native provider work resumes; preserve a closed thread. Keep separate no-automatic-replay protection for uncertain native tool execution and terminal/stop authority.
+- Do not require a per-provider-call Models identity/admission gate or an upstream identity seam. Use the host's standard Models behavior for provider requests; ProviderDoc remains conversation correlation, not proof of delivery or caller authority.
+- Keep adapter preflight-before-progress, enforced by controlled `openHost`, and the existing offline-only acceptance boundary. No live provider calls or spend are authorized by this revision.
+
+This is a deliberate weaker provider-recovery guarantee, not an authorization/security feature. Any future exactly-once or per-round provider-authority requirement needs a new user-approved contract and a suitable public, host-independent API.
+
+The user previously approved the portable-host refinement and documentation changes:
 
 > APPROVED - Let's make the changes needed to the spec/plan.
 
 Apply [Host portability and earned integration seams](../pi-durable-production-runtime-v0/01-architecture.md#host-portability-and-earned-integration-seams):
 Pocket is only one host; standard extensions/configuration come first; any extra helper must earn
 its existence through a concrete API gap and be callable by TUI/programmatic hosts. Hot reload is
-optional DX. This approval changes the integration design, not the durable safety requirements.
+optional DX. At that time this changed the integration design, not the durable safety requirements; the later approved provider-retry exception above supersedes that statement only for ambiguous provider requests.
 
 Normative intent comes from `docs/pi-durable-production-runtime-v0/`:
 
@@ -73,47 +81,68 @@ when exact correlation is proved; otherwise fail closed, without inventing an ad
 turns continue the same conversation with exact fingerprint match.
 Missing, ambiguous or replaced definitions fail closed; no v0 authority migration.
 
-**A4 — Durable turn protocol and exact replay.** Distinguish `completed`, `accepted-incomplete`,
+**A4 — Durable turn protocol and exact saved-result replay.** Distinguish `completed`, `accepted-incomplete`,
 `not-completed`, `unknown`, `authority-drift`. Native settlement remains execution evidence, not a
-license to reinterpret semantic unknown as ordinary failed/aborted. Persist canonical intent/digest,
-runner/native submission/request references and exact result association. Completed replay returns
+license to reinterpret an uncertain tool effect as ordinary failed/aborted. Persist canonical intent/digest,
+runner/native submission/request references and exact result association. Recovery validates each located
+native input's actual `UserEntry` content against immutable turn intent and any persisted submission ID
+against the located submission before allowing native provider progress. Completed replay returns
 the saved exact result without submit, wait, or provider dispatch. A settled exact native answer may
 repair a missing adapter/workflow receipt without dispatch. Never use newest message or mutable
-current-turn state as proof. Unknown is durable and is never automatically resent; automatic generic
-step retries must not redeliver it. Explicit future retries require new logical IDs; general retry chains
-and operator reconciliation machinery remain deferred.
+current-turn state as proof. Unknown tool execution and unsupported identity remain durable and are not
+automatically replayed. A runner failure is `not-completed` only when the exact request has no persisted
+native submission and the reserved thread is still ready; retry then requires a new logical turn ID.
+Once a native submission exists, ordinary runner failure is `unknown` and fences the thread rather
+than inferring that provider work did not start. Provider requests are different: an interrupted native
+generation, compaction, or deferred-poll task may issue another provider request on standard Pi Durable recovery. The adapter
+makes no exactly-once, duplicate-charge, or identical-output guarantee for that boundary. Explicit
+user-initiated retries still require new logical turn IDs; generalized retry chains and operator
+reconciliation machinery remain deferred.
 
-**A5 — Recovery safety and selected preflight.** Uncertain effects must not resume before their durable
-classification can prevent blind resend. The selected implementation is a finite, idempotent preflight
-in an exported portable runtime helper, not Pocket recovery code or a resident scheduler. Every
-adapter host calls its attach/recovery operation after Harness.open and before any resume, submission,
-native waits, timer opening, workflow activation or other progress-enabled path. The standard
-Extension API has no global startup interception point; workflow replay alone runs too late. The
-safety invariant is required; this ordering is the chosen evidenced mechanism, not the only conceivable
-mechanism. A persisted native `request`
-checkpoint cannot prove non-delivery: before-dispatch, after-dispatch and response-before-commit
-crashes are all uncertain. Persist semantic unknown first, then mark uncertain native work aborted;
-repeat the fence idempotently after a crash between those operations. Native abort settlement must
-not overwrite unknown. Inspect owned generation, tool and compaction work, not only runner Tasks.
-A queued input or genuinely not-started phase may progress if exact positive evidence proves no
-unsafe effect occurred; an exact completed settlement replays. Do not blanket-deny proven safe
-cases. Recovery of a tool-result candidate before native settlement is allowed only if no new model
-call is required. Deferred polling, compaction summarization and unsafe tool execution are fenced
-unless positive safe-recovery evidence exists. No assumptions that polling is harmless.
+**A5 — Controlled startup and native provider retry semantics.** The portable runtime owns the
+Harness open and recovery boundary; it does not rely on undocumented global startup hooks or a
+caller-documented order. Hosts call `openHost(storage, context, prepare)`, which keeps the raw Harness,
+composed options and progress-capable methods private until successful startup. `prepare` receives
+only bounded read/inspection, scoped document recovery writes, commit-listener/disposer registration,
+and queued conversation-cancellation capabilities. `prepare` and post-recovery callbacks are awaited;
+commit listeners must remain synchronous, nonthrowing/nonblocking, and avoid Session API reentry.
+`prepare` runs before adapter preflight so listeners and host recovery are ready; registered
+`onAfterAdapterRecovery` callbacks then run after adapter
+preflight and before TimerHost initialization, compatible workflow activation, final pre-resume
+checks and the controlled progress transition. Startup setup is sealed immediately before that
+transition. Early engine access and retained setup calls reject. On failure, acquired listeners are
+disposed, the privately owned Harness is closed using cancellation-independent cleanup context, and
+primary plus cleanup errors are preserved; partial `Harness.open` cleanup diagnostics emitted through
+`onReport` are collected without dropping the host callback. A rejection before Harness construction
+leaves supplied storage untouched for its caller to close; once construction has begun, Harness owns
+its partial-cleanup attempt. On success the Harness and setup disposer transfer to the caller while
+runtime close remains resource-only. The public `Conversation.abort()` resumes the whole
+scheduler, so a queued cancellation can allow other ordinary work/provider spend during that
+controlled transition; no cancellation-priority or no-extra-spend guarantee is claimed.
 
-**A6 — Authority before each new provider round.** Recheck live persisted admission and current
-fingerprint before provider dispatch, not only at initial admission/continuation or prompt preparation.
-Reopening or hot reload cannot let an old phase snapshot execute newly prohibited work. A public
-Models-bound admission composition is a recommended smallest seam, subject to the plan's local
-feasibility proof; ordinary hook exceptions are not a fail-closed gate. Cover both generation
-streamSimple and compaction completeSimple, and positively correlate supported deferred entrypoints
-or fence them. Use public HarnessOptions.models/env composition with injected host dependencies,
-not Pocket model/settings policy. Delegate auth/catalog/routing/transport to the host's Models and
-preserve ordinary conversation behavior, callbacks and live settings. Guarded tools/result definitions
-use standard extensions; environment narrowing is defense in depth, not a replacement for execute
-guards. Model dispatch/session/route correlation remains a proof gate. No special PocketHost lifecycle
-framework is authorized. Do not rebuild transport. Allow native cancellation even while new delivery
-is closed.
+This ordering protects adapter identity, exact-result reconciliation, stop/ownership state and tool
+execution; it is not a provider no-resend guarantee. Interrupted native generation, compaction and
+deferred-poll work may resume according to Pi Durable semantics and may issue another provider
+request even when prior delivery is uncertain. Persist and replay an exact completed result when one
+is available. Continue to durably fence uncertain native tool execution before abort/cleanup; native
+abort settlement must not overwrite that tool-unknown state. When an active Generation checkpoint
+references tool Task IDs, resolve those records through public `getTask`, including terminal
+outcomes; a missing, mismatched, failed or aborted tool outcome is not proof of no side effect and
+must fence the turn before provider progress. Inspect owned generation and tool work, not only runner
+Tasks, but do not block provider replay solely because delivery is uncertain.
+
+**A6 — Authority at logical turn and tool execution boundaries.** Check current workflow/run/thread
+ownership, immutable intent and profile authority when admitting a new logical turn or continuation;
+check live persisted authority again at actual tool execution, including replay and nested paths. Do
+not require a per-provider-round Models gate. Native generation, compaction and deferred provider
+requests use the host's normal Models behavior, including its ordinary recovery semantics. A profile,
+model route, or registry change after turn admission is not guaranteed to revoke an in-flight native
+provider phase; document and accept that limitation rather than pretending a session ID is trusted
+caller identity. Use standard HarnessOptions composition to preserve host settings, ordinary traffic
+and callbacks. Guarded tools/result definitions use standard extensions; environment narrowing is
+defense in depth, not a replacement for execute guards. No special PocketHost lifecycle framework,
+custom transport, or provider-dispatch identity seam is required. Allow native cancellation after stop;
+turn/task admission remains closed for new logical work.
 
 **A7 — Structured success.** When a turn requires a schema, prose cannot complete it successfully.
 Use one schema-bound public result tool, not a generic result framework or Review verdict protocol.
@@ -136,23 +165,26 @@ is acceptable. Do not claim a deleted conversation or a sandbox.
 
 **A9 — Host compatibility and acceptance.** Use installed `@earendil-works/pi-durable` 1.0.2 public
 exports only; no sibling-source aliases, upgrades or additional substrate patch are authorized.
-Register agent definitions before Harness.open; one portable per-Harness runtime factory composes
-the existing engine, extension definitions and public Harness options. No mutable global adapter
-registry or second runtime/legacy path. Its attach operation borrows the caller-owned Harness;
-close releases only runtime-owned timers/listeners/admission. The caller closes the Harness on
-normal shutdown and attach/open failure. Check readiness before arming timers/resuming work.
-Pocket supplies dependencies and calls this interface; it must not implement agent policy. A public
-standalone consumer must use the identical interface/order without Pocket imports or its loader;
-document how a Pi Durable TUI uses it without building a new TUI. Static registration and reopen
-are baseline acceptance; hot reload is optional, never the source of authority truth. No loader
-modifications are planned. Standalone hosts obey the same recovery/dispatch gate as Pocket. Old runs
-without agent records stay compatible; no speculative backfill or mutation of existing stored kinds.
+Register agent workflow definitions before `openHost`; one portable per-Harness runtime factory
+composes the existing engine, extension definitions and public Harness options internally. The public
+runtime exposes `openHost`, bounded `register`, ready-only engine access and resource-only `close`;
+it exposes no raw composed options, attach/open split or second runtime/legacy path. `openHost` owns
+Harness acquisition and closes it on failed startup; after success the host receives Harness and a
+setup disposer. Pocket supplies dependencies and calls this interface; it must not implement agent
+policy. A public standalone consumer must use the identical interface/order without Pocket imports
+or its loader; document how a Pi Durable TUI uses it without building a new TUI. Static registration
+and reopen are baseline acceptance; hot reload is optional, never the source of authority truth. No
+loader modifications are planned. Standalone hosts use the same controlled startup lifecycle, turn
+admission and tool-execution safeguards as Pocket, while provider retries follow native Pi Durable
+semantics. Old runs without agent records stay compatible; no speculative backfill or mutation of
+existing stored kinds.
 Unknown or unsupported agent record versions remain durable/inspectable and cannot auto-dispatch.
 Real-provider smoke acceptance is gated separately; scripted native acceptance is not live acceptance.
 
 Out of scope: Verify, Review policy/verdicts/revision binding, StartWork, UI, migrations, generalized
-roles/delegation/retries, optional policy services, planner repair, installations/upgrades, commits,
-restarts and implementation during this authorship attempt.
+roles/delegation/retry chains, optional policy services, planner repair, installations/upgrades,
+commits and restarts. Provider replay only follows existing Pi Durable recovery; no new generic retry
+framework is authorized.
 
 ## 3. Installed evidence and smallest adaptations
 
@@ -161,75 +193,72 @@ Evidence root **D** = `node_modules/@earendil-works/pi-durable/dist/`; **AI** =
 for this plan. Implementation imports remain public; reading internals is evidence, not permission to
 import them. Package metadata confirms 1.0.2 and export surface in `D/index.d.ts`.
 
-| ID / requirement | Installed reality / precise source anchor                                                                                                                                                                                                                                                                                                         | Smallest adaptation                                                                                                                                                                                                                                            | Acceptance                                                                                |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| E1 / A1,A3       | `D/session/transaction.js:112–151`, `#stageConversation`: task-owned cross-conversation edge. `D/types.d.ts`, TaskRuntime.commit/conversation and Tx.createTask/createConversation.                                                                                                                                                               | Atomic logical mapping + native conversation creation, owner = workflow Task; per-turn owned runner Task with native joins. No registry of children beyond exact references needed for correlation/cleanup.                                                    | T2 identity/continuation; T6 owner cleanup.                                               |
-| E2 / A3,A4       | `D/harness/submissions.js:118–127`, admitSubmission: requestId compares type only, not immutable content or provider delivery. submit and wait call resume (`:33`, `:49`).                                                                                                                                                                        | Persist canonical payload and authority identity before submit; reserve deterministic tuple-derived request identity; non-progress lookup by request repairs mapping gap.                                                                                      | T2 conflicting/concurrent intent; T3 submit/receipt gaps.                                 |
-| E3 / A4,A5       | `D/harness/generation.js:91–128`, request; `:293`, streamResponse→models.streamSimple: resumed request calls provider without delivery marker. `D/harness/scheduler.js:80–110`, open changes running→pending; resume enables scheduling.                                                                                                          | Mandatory startup preflight classifies exact evidence, saves unknown, abort-marks uncertain native work before enabling scheduling. Repeat after crash. No native core patch evidenced.                                                                        | T3 SIGKILL before/after dispatch; unknown persists despite native abort.                  |
-| E4 / A5,A6       | `D/harness/scheduler.js:959–973`, hooks.each reports/swallow errors unless aborted. `D/harness/harness.js:159–174`: submission/status/abortTask versus waits enabling progress.                                                                                                                                                                   | Use public inspection/Tx reads/commit/abortTask for startup; do not use throwing beforeRequest as fence or generic step.do reconciliation as sole defense. Distinct dispatch gate for runtime drift.                                                           | T1 fail-closed composition; T3 no dispatch before preflight.                              |
-| E5 / A5,A6       | `D/harness/generation.js:133–142`, poll→fetchDeferred; `D/harness/compaction.js:101–129`, summarize→completeSimple; `D/harness/provider.js`, ProviderDoc/ensureProviderSessionId; `AI/models.d.ts:180–184`, public model methods.                                                                                                                 | Correlate registered adapter conversations via persisted ProviderDoc session identity. Validate Models admission composition locally for new rounds, including completeSimple. Unsupported deferred correlation or uncertain provider phases fence explicitly. | T1 entrypoint proof; T3 unsafe poll/compaction vs proven safe phase; T4 reload drift.     |
-| E6 / A2          | `D/harness/agent.js:125–211`, resolveAgent/selectExtensions: missing names omitted, same name last wins, selected wraps applied. `D/harness/tool.js:66–82`, safe replay runs execute without beforeTool. `src/server/extensions/codemode.ts:294`, nested tool.execute.                                                                            | Audited explicit effective manifest + implementation versions; final guarded execution boundary that trusted wraps cannot strip. Recheck live manifest/persisted authority in execute. Public env FS/Shell narrowing is defense in depth.                      | T4 direct, replay, nested, missing/replaced/ambiguous definitions and hot reload.         |
-| E7 / A7          | `D/harness/types.d.ts:292–304`, ConversationStreamOptions has no durable schema responseFormat. `D/harness/generation.js:469–499`, finishToolRound terminates only if every slot requests it; done answer is assistant entry.                                                                                                                     | Schema-bound result tool, candidate commit with exact identities; promote only exact candidate/tool/native settlement. No newest-message/prose shortcut.                                                                                                       | T5 sole direct valid result; malformed/stale/mixed/nested; crash before/after settlement. |
-| E8 / A8          | `D/harness/scheduler.js`, #ownedLive, #belowCancelled, abortConversation: ordinary traversal excludes background; successful terminal waits descendants, terminal owner does not cascade. No public delete/dispose in `D/index.d.ts` / harness types. Core WorkflowInspection.cleanup is pending/native-settled, not proof of successful cleanup. | Close admission transactionally; native abort/idle plus actual outcome inspection; retain references/error for idempotent retry of cleanup. Delegation stays off rather than reuse background subagents.                                                       | T6 stop ordering, idle admission, cleanup failure/kill/reopen.                            |
-| E9 / A5,A9       | `src/server/app.ts:333–420`: extensions→Harness.open→#recover→spend/subscriptions→WorkflowEngine.open. Core `WorkflowEngine.open`: TimerHost.open→harness.resume→activation. `packages/workflow-runtime/index.ts` exports core/shared kernel.                                                                                                     | Portable factory returns extension/options and attach/open/close; Pocket only supplies dependencies/calls it. All hosts attach before progress. Replace singleton registration, preserve options, close borrowed Harness on failure. No loader changes.        | T7 real Pocket lifecycle and standalone-host preflight, Targets1/2 regression.            |
+| ID / requirement | Installed reality / precise source anchor                                                                                                                                                                                                                                                                                                         | Smallest adaptation                                                                                                                                                                                                                                                                                                                                               | Acceptance                                                                                |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| E1 / A1,A3       | `D/session/transaction.js:112–151`, `#stageConversation`: task-owned cross-conversation edge. `D/types.d.ts`, TaskRuntime.commit/conversation and Tx.createTask/createConversation.                                                                                                                                                               | Atomic logical mapping + native conversation creation, owner = workflow Task; per-turn owned runner Task with native joins. No registry of children beyond exact references needed for correlation/cleanup.                                                                                                                                                       | T2 identity/continuation; T6 owner cleanup.                                               |
+| E2 / A3,A4       | `D/harness/submissions.js:118–127`, admitSubmission: requestId compares type only, not immutable content or provider delivery. submit and wait call resume (`:33`, `:49`).                                                                                                                                                                        | Persist canonical payload and authority identity before submit; reserve deterministic tuple-derived request identity; non-progress lookup by request repairs mapping gap.                                                                                                                                                                                         | T2 conflicting/concurrent intent; T3 submit/receipt gaps.                                 |
+| E3 / A4,A5       | `D/harness/generation.js:91–128`, request; `:293`, streamResponse→models.streamSimple: resumed request calls provider without a delivery marker. `D/harness/scheduler.js:80–110`, open changes running→pending; resume enables scheduling.                                                                                                        | Attach/preflight before progress to reconcile exact completed answers and protect adapter/tool state; allow uncertain native provider work to resume under core semantics. No provider no-resend guarantee or substrate patch.                                                                                                                                    | T3 exact saved-answer replay; ambiguous provider crash may add a dispatch marker.         |
+| E4 / A5,A6       | `D/harness/scheduler.js:959–973`, hooks.each reports/swallow errors unless aborted. `D/harness/harness.js:159–174`: submission/status/abortTask versus waits enabling progress.                                                                                                                                                                   | Use public inspection/Tx reads/commit/abortTask for controlled startup ordering and tool-state recovery. Do not use swallowed hooks as an enforcement boundary; no per-call Models dispatch gate is required.                                                                                                                                                     | T1 controlled preflight-before-progress; T3 provider retry and tool-fence cases.          |
+| E5 / A4,A6       | `D/harness/generation.js:133–142`, poll→fetchDeferred; `D/harness/compaction.js:101–129`, summarize→completeSimple; `D/harness/provider.js`, ProviderDoc/ensureProviderSessionId; `AI/models.d.ts:180–184`, public model methods.                                                                                                                 | Use ProviderDoc only to correlate a native conversation. Let generation, compaction and deferred requests use host Models and standard recovery semantics; keep separate tool-execution fencing. No trusted Models identity seam or session-ID dispatch gate.                                                                                                     | T3 exact result replay vs possible provider reissue; T4 turn/tool authority.              |
+| E6 / A2          | `D/harness/agent.js:125–211`, resolveAgent/selectExtensions: missing names omitted, same name last wins, selected wraps applied. `D/harness/tool.js:66–82`, safe replay runs execute without beforeTool. `src/server/extensions/codemode.ts:294`, nested tool.execute.                                                                            | Audited explicit effective manifest + implementation versions; final guarded execution boundary that trusted wraps cannot strip. Recheck live manifest/persisted authority in execute. Public env FS/Shell narrowing is defense in depth.                                                                                                                         | T4 direct, replay, nested, missing/replaced/ambiguous definitions and hot reload.         |
+| E7 / A7          | `D/harness/types.d.ts:292–304`, ConversationStreamOptions has no durable schema responseFormat. `D/harness/generation.js:469–499`, finishToolRound terminates only if every slot requests it; done answer is assistant entry.                                                                                                                     | Schema-bound result tool, candidate commit with exact identities; promote only exact candidate/tool/native settlement. No newest-message/prose shortcut.                                                                                                                                                                                                          | T5 sole direct valid result; malformed/stale/mixed/nested; crash before/after settlement. |
+| E8 / A8          | `D/harness/scheduler.js`, #ownedLive, #belowCancelled, abortConversation: ordinary traversal excludes background; successful terminal waits descendants, terminal owner does not cascade. No public delete/dispose in `D/index.d.ts` / harness types. Core WorkflowInspection.cleanup is pending/native-settled, not proof of successful cleanup. | Close admission transactionally; native abort/idle plus actual outcome inspection; retain references/error for idempotent retry of cleanup. Delegation stays off rather than reuse background subagents.                                                                                                                                                          | T6 stop ordering, idle admission, cleanup failure/kill/reopen.                            |
+| E9 / A5,A9       | `src/server/app.ts:333–420`: extensions→Harness.open→#recover→spend/subscriptions→WorkflowEngine.open. Core `WorkflowEngine.open`: TimerHost.open→harness.resume→activation. `packages/workflow-runtime/index.ts` exports core/shared kernel.                                                                                                     | Portable factory returns extension, bounded registration, ready-only engine access, `openHost` and `close`; its restricted setup facade supports caller recovery/listeners without raw Harness or progress methods. Pocket supplies dependencies/calls it; runtime closes Harness on failed startup and successful host owns Harness/disposer. No loader changes. | T7 real Pocket lifecycle and standalone-host preflight, Targets1/2 regression.            |
 
 ## 4. Minimal durable vocabulary and seam
 
-### Portable composition interface (proposed, not shipped)
+### Portable composition interface (implemented; Target 3 acceptance pending review)
 
-One factory, provisionally `createWorkflowAgentRuntime({harnessOptions, agentConfig, timerOptions})`,
-returns a standard extension, composed public Harness options and bounded attach/open/close
-operations alongside the existing engine's workflow registration/inspection interface. Final names
-are proved in T1; do not add a plugin lifecycle framework or forwarding facade for every Harness API.
+One factory, `createWorkflowAgentRuntime({harnessOptions, agentConfig, timerOptions})`, returns a
+standard extension, bounded workflow registration, ready-only engine access, controlled `openHost`
+and resource-only `close`. Composed options remain private. The small setup facade exposes only
+read/inspection, scans, scoped document updates, commit subscriptions with disposer ownership, queued
+conversation cancellations and registered post-adapter-recovery callbacks; it never exposes the raw
+Harness, Tx, generic commit, wait, resume, submit or abort handles. No plugin lifecycle framework or
+forwarding facade for every Harness API is added.
 
 ```ts
 const runtime = createWorkflowAgentRuntime({ harnessOptions: baseOptions, agentConfig });
-registry.install(runtime.extension); // before Harness.open; no duplicate singleton Task definition
-let harness: Harness | undefined;
-const failures: unknown[] = [];
+registry.install(runtime.extension); // before openHost; no duplicate singleton Task definition
+runtime.register(workflow); // definitions needed to activate persisted runs are supplied up front
+
+const host = await runtime.openHost(storage, context, async (setup) => {
+    setup.subscribeCommits(onCommit); // installed before adapter recovery
+    setup.onAfterAdapterRecovery(async (recovered) => {
+        await recoverHostDocuments(recovered); // only through scoped document writes
+        recovered.requestConversationAbort(conversationId); // queued until controlled progress
+    });
+    return hostPreparationResult;
+});
+
 try {
-    harness = await Harness.open(storage, runtime.options, context);
-    await runtime.attach(harness, context); // finite recovery; no scheduling/timers/native waits
-    // Host-specific setup/listeners, whether Pocket, a TUI or programmatic.
-    await runtime.open(context); // existing engine starts timers/resumes last
-    // Host operation uses the same runtime; no Pocket imports required.
-} catch (error) {
-    failures.push(error); // primary startup/operation failure is always first
+    const engine = runtime.engine; // unavailable until successful controlled startup
+    await runHost(runtime, host.harness, engine, host.prepared);
 } finally {
-    try {
-        await runtime.close(); // borrowed Harness is not closed here
-    } catch (error) {
-        failures.push(error);
-    }
-    if (harness !== undefined) {
-        try {
-            await harness.close(cleanupContext); // caller owns Harness, even on partial startup
-        } catch (error) {
-            failures.push(error);
-        }
-    }
-}
-if (failures.length === 1) {
-    throw failures[0];
-}
-if (failures.length > 1) {
-    throw new AggregateError(failures, "Host operation/cleanup failed", { cause: failures[0] });
+    await host.dispose(); // successful setup listener ownership transfers to the caller
+    await runtime.close(); // releases runtime-owned timers/admission, not the Harness
+    await host.harness.close(cleanupContext);
 }
 ```
 
-`cleanupContext` must remain usable if the operation context was cancelled. Harness acquisition
-failure and factory-owned partial allocation must release their respective resources; cleanup must
-not mask the original startup error: rethrow a sole failure unchanged; for multiple failures retain
-all diagnostics and the primary failure as the aggregate cause/first entry. Test cancelled operation
-contexts plus simultaneous attach/open and runtime/Harness cleanup failures. Configure/create does
-not arm resources requiring a Harness.
-The composed options preserve registry, live settings, now, onReport, default env and existing
-conversationCreated callbacks. Chain creation callbacks within native transaction restrictions.
-Preserve non-adapter default extension selection: installing result tools must not expose them to
-ordinary chats. The factory accepts existing host Models/env/config; no Pocket path discovery.
-Replace, rather than duplicate, current singleton workflow registration for an agent-enabled host;
-existing generic runtime consumers/stored kinds remain compatible, without a new legacy execution
-path. Hot-reload notifications are not required to recompute actual registry/config fingerprints.
+`openHost` privately acquires the Harness, runs bounded preparation, performs adapter preflight,
+then invokes registered post-recovery setup before TimerHost initialization, compatible activation,
+final pre-resume checks, and the controlled progress transition. The setup facade seals immediately
+before progress. On startup failure, setup disposers run and runtime closes the privately acquired
+Harness with cancellation-independent cleanup context; the primary error remains first/cause if
+cleanup also fails. On success, Harness and disposer ownership transfer to the caller. Public
+`Conversation.abort()` resumes the whole scheduler, so queued startup cancellation may allow ordinary
+work/provider spend during that transition; this lifecycle does not promise cancellation priority.
+
+Harness acquisition failure and factory-owned partial allocation release their respective resources;
+cleanup must not mask the original startup error. Preserve live settings, now, onReport, default env
+and existing conversationCreated callbacks through private option composition. Chain creation
+callbacks within native transaction restrictions. Preserve non-adapter default extension selection:
+installing result tools must not expose them to ordinary chats. The factory accepts existing host
+Models/env/config; no Pocket path discovery. Replace, rather than duplicate, current singleton
+workflow registration for an agent-enabled host; existing generic runtime consumers/stored kinds
+remain compatible, without a new legacy execution path. Hot-reload notifications are not required to
+recompute actual registry/config fingerprints.
 
 ### Durable records and invocation binding
 
@@ -265,12 +294,18 @@ wrap order, delegation=false, model route and thinking/behavioral settings, resu
 content. Store inputs for drift diagnosis. Name/schema equality alone is not code identity; explicit
 versions require deployment discipline. Current manifest must be rechecked despite cached snapshots.
 
-Startup recovery and runtime dispatch admission are separate obligations. The former already has
-positive source evidence and public non-progress APIs. The latter Models seam is a recommendation,
-not a proven implementation. T1 must prove typed public composition, unambiguous session mapping,
-fail-closed behavior and no ungated entrypoint before any agent-enabled host progresses. Failure is
-BLOCKED with concrete unsupported API/entrypoint evidence, not authorization for a core patch,
-upgrade, custom provider transport or hook-only substitute.
+Startup ordering, turn admission and tool-execution authority are separate obligations. Adapter
+preflight must complete before timer initialization or any other progress-enabled path. Repeat
+recovery after TimerHost initialization and immediately before the controlled Harness progress transition; a stop/terminal
+selection during the asynchronous timer scan must fence pending work before scheduling resumes. For every active runner, match Task owner and `workflowTaskId` to the durable thread owner and
+exact turn identity. Account for every adapter-correlated active native task; if no exact active
+runner owns it, fence/abort it rather than letting scheduler recovery run it unobserved. A closed
+thread must stay closed through recovery and native abort settlement. New logical turns must match
+their workflow owner and immutable intent; actual tool execution must recheck current authority. A
+per-call Models seam is not part of the revised contract. Standard provider requests—including an
+ambiguous deferred poll—may be repeated by native recovery, so unsupported Models identity/session
+correlation is not a blocker and must not be replaced with a Pocket-only patch or an untrusted
+caller-supplied identity.
 
 ## 5. Acceptance and review boundary
 
@@ -280,11 +315,7 @@ with persisted dispatch counters. Existing generic core crash tests are fixture 
 acceptance. Include exact native answer committed before runner/workflow receipt, and candidate
 committed before tool/native settlement; exercise actual Pocket startup, not only independent Harness.
 
-Essential baseline: A1–A9 including evidenced startup no-resend fence, actual tool enforcement,
-structured exact correlation, native-owned lifetime and retained cleanup. Optional/unproven/deferred:
-Models gate mechanics until T1 proves them; deferred/poll recovery until safe correlation is proven;
-authority migration, result frameworks, child registries, native deletion, retries/Review policy and live
-provider acceptance without approval. Unsupported work fails closed without silently expanding scope.
+Essential baseline: revised A1–A9, including controlled preflight-before-progress, exact saved-result replay, workflow-turn ownership, actual tool enforcement, structured exact correlation, native-owned lifetime and retained cleanup. Provider requests may be repeated after ambiguous recovery under native Pi Durable semantics; no exactly-once provider guarantee is claimed. Deferred/poll requests follow that same native behavior. Still deferred: authority migration, generalized result frameworks, child registries, native deletion, retry/Review policy and live-provider acceptance without approval. Unsupported identities and uncertain tool executions remain inspectable and fenced.
 
 Independent document review must verify normative→gap→adapter→test traceability, safe versus
 uncertain phase classification, native ownership, current-runtime binding, stop ordering, migration
