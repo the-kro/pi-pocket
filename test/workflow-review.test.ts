@@ -13,7 +13,10 @@ import {
     MemoryStorage,
     section,
 } from "@earendil-works/pi-durable";
-import { workflowAgentResultSchemaFingerprint } from "../packages/workflow-runtime/agents/profile.ts";
+import {
+    workflowAgentResultSchemaFingerprint,
+    type WorkflowAgentReviewProfileDescriptor,
+} from "../packages/workflow-runtime/agents/profile.ts";
 import { defineWorkflow, type WorkflowContext } from "../packages/workflow-runtime/core/index.ts";
 
 const reviewApi = await import("../packages/workflow-runtime/review/contract.ts").catch(
@@ -731,7 +734,9 @@ test("Review uses a separate schema-bound read-only reviewer and promotes only f
                 content: "Implement the requested fix.",
             });
 
-            const reviewerDescriptor = await context.agent.resolveReviewProfile(reviewerProfile.id);
+            const reviewerDescriptor = (await context.agent.resolveProfile(
+                reviewerProfile.id,
+            )) as unknown as WorkflowAgentReviewProfileDescriptor;
             const reviewRequest = {
                 ...reviewRequestBase,
                 reviewerIdentity: workflowRuntime.createReviewReviewerIdentity(reviewerDescriptor),
@@ -928,7 +933,7 @@ function fakeReviewProfileDescriptor(identity: typeof structuredRequest.reviewer
 
 function fakeReviewContext(
     turn: (input: unknown) => Promise<unknown>,
-    resolveReviewProfile: (profileId: string) => Promise<unknown> = async () =>
+    resolveProfile: (profileId: string) => Promise<unknown> = async () =>
         fakeReviewProfileDescriptor(structuredRequest.reviewerIdentity),
 ) {
     const completed = new Map<string, unknown>();
@@ -936,7 +941,7 @@ function fakeReviewContext(
     const context = {
         input: null,
         signal: controller.signal,
-        agent: { turn, resolveReviewProfile },
+        agent: { turn, resolveProfile },
         step: {
             async do(operationId: string, callback: () => Promise<unknown> | unknown) {
                 if (completed.has(operationId)) {

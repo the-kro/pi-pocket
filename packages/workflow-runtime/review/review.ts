@@ -172,7 +172,7 @@ export async function review<I extends JsonValue>(
     if (
         context.agent === undefined ||
         typeof context.agent.turn !== "function" ||
-        typeof context.agent.resolveReviewProfile !== "function"
+        typeof context.agent.resolveProfile !== "function"
     ) {
         throw new ReviewAdmissionError(
             "Review requires Target 3 runtime-owned profile resolution and turn admission",
@@ -188,7 +188,9 @@ export async function review<I extends JsonValue>(
     let resolvedProfile: WorkflowAgentReviewProfileDescriptor;
 
     try {
-        resolvedProfile = await context.agent.resolveReviewProfile(stableRequest.reviewerProfile);
+        resolvedProfile = (await context.agent.resolveProfile(
+            stableRequest.reviewerProfile,
+        )) as unknown as WorkflowAgentReviewProfileDescriptor;
     } catch (error) {
         throw new ReviewAdmissionError("The configured Review profile could not be resolved", {
             cause: error,

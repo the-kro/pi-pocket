@@ -76,6 +76,7 @@ before(async () => {
         "export default () => { throw new Error('a drop-in must not replace a built-in'); };",
     );
     app = await openApp(model, dataDir);
+    app.loader.watch();
 });
 
 after(async () => {
@@ -127,7 +128,6 @@ test("a drop-in that is on gives Pi its tools and hooks, reloads when edited, an
     const tab = fakeTab(undefined, owner(app));
 
     await app.attach(tab.client);
-    app.loader.watch();
 
     try {
         writeFileSync(join(dropIns, "shout.ts"), shout("!!"));

@@ -68,11 +68,17 @@ import {
     createWorkflowAgentRunnerTask,
     createWorkflowAgentTurnBinder,
     workflowAgentNativeSelectionMatches,
-    workflowAgentProfileSnapshot,
     workflowAgentSectionViewsMatch,
-    resolveWorkflowAgentReviewProfile,
-    type WorkflowAgentProfileSnapshot,
 } from "./runner.ts";
+import {
+    type WorkflowAgentProfileSnapshot,
+    workflowAgentProfileSnapshot,
+} from "./profile-snapshot.ts";
+import {
+    resolveWorkflowAgentReviewProfile,
+    workflowAgentReviewResolutionMatches,
+    workflowAgentReviewThreadAdmissionMatches,
+} from "./review-policy.ts";
 
 function exactPersistedSelection(actual: unknown, expected: readonly string[]): boolean {
     if (
@@ -1052,17 +1058,21 @@ function currentRunnerProfileSnapshot(
         const resolved = resolveWorkflowAgentReviewProfile(models, config, profile.id, registry);
 
         reviewIdentityIsCurrent =
-            sameJson(
-                resolved.descriptor.identity as unknown as JsonValue,
+            workflowAgentReviewResolutionMatches(
+                resolved,
                 input.reviewerIdentity,
-            ) &&
-            sameJson(
-                resolved.snapshot.authority as unknown as JsonValue,
                 input.effectiveAuthority,
             ) &&
             turn.purpose === "review" &&
             turn.freshThread === input.freshThread &&
-            sameJson(turn.reviewerIdentity, input.reviewerIdentity);
+            sameJson(turn.reviewerIdentity, input.reviewerIdentity) &&
+            workflowAgentReviewThreadAdmissionMatches(thread, {
+                turnId: turn.turnId,
+                intentCanonical: turn.intentCanonical,
+                intentDigest: turn.intentDigest,
+                freshThread: turn.freshThread,
+                reviewerIdentity: turn.reviewerIdentity,
+            });
     } else {
         reviewIdentityIsCurrent =
             input.purpose === undefined &&

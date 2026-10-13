@@ -17,6 +17,7 @@ import {
     WORKFLOW_REVIEW_RESULT,
     type ReviewAdapters,
     type ReviewResult,
+    type WorkflowAgentReviewProfileDescriptor,
     type WorkflowAgentRuntime,
     type WorkflowAgentHost,
     type WorkflowContext,
@@ -143,7 +144,9 @@ test("public standalone host runs and recovers an offline Review consumer", asyn
         version: 1,
         async run(context: WorkflowContext<null>) {
             assert.ok(context.agent);
-            const reviewer = await context.agent.resolveReviewProfile(reviewerProfile.id);
+            const reviewer = (await context.agent.resolveProfile(
+                reviewerProfile.id,
+            )) as unknown as WorkflowAgentReviewProfileDescriptor;
 
             const result = await review(
                 context,

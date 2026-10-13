@@ -16,12 +16,10 @@ import {
     type TaskRuntime,
     type Tx,
     type UserInput,
-    type Extension,
     type RegistryReader,
-    type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import type { Models } from "@earendil-works/pi-ai";
-import { canonicalInput, freezeJson } from "../core/identity.ts";
+import { canonicalInput } from "../core/identity.ts";
 import {
     RUN_DOC,
     type WorkflowAgentTurnBinder,
@@ -30,21 +28,23 @@ import {
 import {
     type AgentThreadIdentity,
     type ResolvedWorkflowAgentConfig,
-    type WorkflowAgentCallAuthority,
     type EffectiveWorkflowAgentAuthority,
-    type WorkflowAgentProfile,
     type WorkflowAgentResultBinding,
-    type WorkflowAgentReviewProfileDescriptor,
     type WorkflowAgentReviewIdentity,
-    resolveWorkflowAgentAuthority,
-    workflowAgentModelFingerprint,
-    workflowAgentModelIdentityInputs,
-    workflowAgentProfileFingerprint,
     workflowAgentProviderSessionId,
-    workflowAgentResultExtensionName,
-    workflowAgentResultSchemaFingerprint,
     workflowAgentThreadKey,
 } from "./profile.ts";
+import {
+    type WorkflowAgentReviewProfileResolution,
+    resolveWorkflowAgentReviewProfile,
+    workflowAgentReviewIdentityMatches,
+    workflowAgentReviewResolutionMatches,
+    workflowAgentReviewThreadAdmissionMatches,
+} from "./review-policy.ts";
+import {
+    type WorkflowAgentProfileSnapshot,
+    workflowAgentProfileSnapshot,
+} from "./profile-snapshot.ts";
 import {
     AGENT_RUNNER_TASK_NAME,
     AGENT_THREAD_DOC,
@@ -56,10 +56,7 @@ import {
     settleWorkflowAgentTurnInTransaction,
     workflowAgentTurnResultSchema,
 } from "./structured-result.ts";
-import {
-    workflowAgentSectionSourceName,
-    workflowAgentSectionViewName,
-} from "./section-registry.ts";
+import { workflowAgentSectionSourceName } from "./section-registry.ts";
 
 export type WorkflowAgentTurnInput = {
     readonly threadId: string;
@@ -102,19 +99,6 @@ type AgentRunnerInput = {
 type AgentRunnerCheckpoint = { readonly phase: "run" };
 type AgentRunnerRuntime = TaskRuntime<AgentRunnerInput, AgentRunnerCheckpoint, JsonValue, object>;
 type AgentRunnerTask = ReturnType<typeof createWorkflowAgentRunnerTask>;
-
-export type WorkflowAgentProfileSnapshot = {
-    readonly profile: WorkflowAgentProfile;
-    readonly profileFingerprint: string;
-    readonly modelFingerprint: string;
-    readonly authorityFingerprint: string;
-    readonly profileInput: JsonValue;
-    readonly modelInput: JsonValue;
-    readonly authority: EffectiveWorkflowAgentAuthority;
-    readonly authorityInput: JsonValue;
-    readonly extensions: readonly Extension[];
-    readonly tools: readonly ToolRegistration[];
-};
 
 export function workflowAgentSectionViewsMatch(
     agent: Agent,
@@ -310,283 +294,6 @@ function requestId(threadKey: string, turnId: string): string {
     return `${TURN_REQUEST_PREFIX}${Buffer.from(JSON.stringify([threadKey, turnId]), "utf8").toString("base64url")}`;
 }
 
-export function workflowAgentProfileSnapshot(
-    models: Models,
-    config: ResolvedWorkflowAgentConfig,
-    profile: WorkflowAgentProfile,
-    call: WorkflowAgentCallAuthority,
-    registry: RegistryReader,
-): WorkflowAgentProfileSnapshot {
-    const profileInput = copyJson(profile as unknown as JsonValue);
-    const current = workflowAgentModelFingerprint(models, profile);
-    const authority = resolveWorkflowAgentAuthority(config, profile, call);
-    const snapshot = registry.snapshot();
-    const sourceExtensions = authority.extensions.map((entry) => {
-        const extension = snapshot.extension(entry.name);
-
-        if (extension === undefined) {
-            throw new WorkflowAgentAdmissionError(
-                `Agent extension ${entry.name} is missing from the current registry`,
-            );
-        }
-
-        return extension;
-    });
-    const selectedSectionKeys = new Map<string, Set<string>>();
-
-    for (const section of authority.sections) {
-        const keys = selectedSectionKeys.get(section.extension) ?? new Set<string>();
-
-        keys.add(section.key);
-        selectedSectionKeys.set(section.extension, keys);
-    }
-
-    const registeredSections = sourceExtensions.flatMap((extension) =>
-        (extension.sections ?? [])
-            .filter((section) => selectedSectionKeys.get(extension.name)?.has(section.key))
-            .map((section) => ({ extension: extension.name, key: section.key })),
-    );
-
-    if (
-        registeredSections.length !== authority.sections.length ||
-        registeredSections.some(
-            (section, index) =>
-                authority.sections[index]?.extension !== section.extension ||
-                authority.sections[index]?.key !== section.key,
-        )
-    ) {
-        throw new WorkflowAgentAdmissionError(
-            "Agent effective sections are missing, ambiguous, or out of registry order",
-        );
-    }
-
-    for (const section of authority.sections) {
-        const matches = snapshot
-            .sections()
-            .filter(
-                (candidate) =>
-                    candidate.extension.name === section.extension &&
-                    candidate.section.key === section.key,
-            );
-
-        if (matches.length !== 1) {
-            throw new WorkflowAgentAdmissionError(
-                `Agent section ${section.key} is missing or ambiguous in the current registry`,
-            );
-        }
-    }
-
-    const extensions = authority.extensions.map((entry, index) => {
-        const source = sourceExtensions[index]!;
-        const selectedKeys = (source.sections ?? [])
-            .filter((section) => selectedSectionKeys.get(entry.name)?.has(section.key))
-            .map((section) => section.key);
-        const viewName = workflowAgentSectionViewName(
-            entry.name,
-            entry.version,
-            (source.sections ?? []).map((section) => section.key),
-            selectedKeys,
-        );
-
-        if (viewName === entry.name) {
-            return source;
-        }
-
-        const view = snapshot.extension(viewName);
-
-        if (
-            view === undefined ||
-            view.name !== viewName ||
-            !sameStrings(
-                (view.sections ?? []).map((section) => section.key),
-                selectedKeys,
-            )
-        ) {
-            throw new WorkflowAgentAdmissionError(
-                `Agent section view for extension ${entry.name} is missing or ambiguous`,
-            );
-        }
-
-        return view;
-    });
-    const selectedToolDefinitions = sourceExtensions.flatMap((extension) =>
-        (extension.tools ?? []).map((tool) => ({ extension: extension.name, tool })),
-    );
-    const selectedToolNames = selectedToolDefinitions.map(({ tool }) => tool.name);
-
-    if (new Set(selectedToolNames).size !== selectedToolNames.length) {
-        throw new WorkflowAgentAdmissionError(
-            "Agent selected extensions contain duplicate tool names; authority is ambiguous",
-        );
-    }
-
-    const tools = authority.tools.map((entry) => {
-        const matches = selectedToolDefinitions.filter(({ tool }) => tool.name === entry.name);
-
-        if (matches.length !== 1 || matches[0]!.extension !== entry.extension) {
-            throw new WorkflowAgentAdmissionError(
-                `Agent tool ${entry.name} is missing, duplicated, or unexpectedly replaced`,
-            );
-        }
-
-        return matches[0]!.tool as ToolRegistration;
-    });
-    const authorityInput = copyJson({
-        delegation: false,
-        floor: config.authority ?? {},
-        declaredProfile: {
-            extensions: profile.extensions ?? [],
-            sections: profile.sections ?? [],
-            tools: profile.tools ?? [],
-            capabilities: profile.capabilities ?? [],
-            result: profile.result ?? null,
-        },
-        resultSchema:
-            profile.result === undefined
-                ? null
-                : {
-                      id: profile.result.id,
-                      version: profile.result.version,
-                      toolName: profile.result.toolName,
-                      fingerprint: workflowAgentResultSchemaFingerprint(profile.result),
-                  },
-        effectiveAuthority: {
-            extensions: authority.extensions,
-            sections: authority.sections,
-            tools: authority.tools,
-            capabilities: authority.capabilities,
-        },
-        selectionViews: authority.extensions.map((entry, index) => ({
-            sourceName: entry.name,
-            selectedName: extensions[index]!.name,
-            sections: (extensions[index]!.sections ?? []).map((section) => section.key),
-        })),
-        registry: authority.extensions.map((entry, index) => {
-            const extension = sourceExtensions[index]!;
-
-            return {
-                name: entry.name,
-                version: entry.version,
-                order: index,
-                tools: (extension.tools ?? []).map((tool) => ({
-                    name: tool.name,
-                    schema: JSON.parse(JSON.stringify(tool.parameters)) as JsonValue,
-                    replay: tool.replay ?? "unsafe",
-                })),
-                sections: (extension.sections ?? []).map((section) => section.key),
-                wraps: (extension.wraps ?? []).map((wrap) =>
-                    "tool" in wrap ? { tool: wrap.tool } : { section: wrap.section },
-                ),
-            };
-        }),
-        instructions: profile.instructions,
-        instructionsVersion: profile.instructionsVersion,
-        thinkingLevel: profile.thinkingLevel ?? "off",
-    } as unknown as JsonValue);
-
-    return {
-        profile,
-        profileFingerprint: workflowAgentProfileFingerprint(profile),
-        authorityFingerprint: canonicalInput(authorityInput).digest,
-        modelFingerprint: current.fingerprint,
-        profileInput,
-        modelInput: copyJson(workflowAgentModelIdentityInputs(current.model)),
-        authority,
-        authorityInput,
-        extensions,
-        tools,
-    };
-}
-
-export type WorkflowAgentReviewProfileResolution = {
-    readonly descriptor: WorkflowAgentReviewProfileDescriptor;
-    readonly snapshot: WorkflowAgentProfileSnapshot;
-};
-
-export function resolveWorkflowAgentReviewProfile(
-    models: Models,
-    config: ResolvedWorkflowAgentConfig,
-    profileId: string,
-    registry: RegistryReader,
-): WorkflowAgentReviewProfileResolution {
-    const review = config.review;
-    const profile = config.byId.get(profileId);
-
-    if (review === undefined) {
-        throw new WorkflowAgentAdmissionError("Review profile resolution is not configured");
-    }
-
-    if (!review.profileAllowlist.includes(profileId) || profile === undefined) {
-        throw new WorkflowAgentAdmissionError(
-            `Agent profile ${profileId} is not on the Review profile allowlist`,
-        );
-    }
-
-    const available = resolveWorkflowAgentAuthority(config, profile);
-    const resultExtension =
-        profile.result === undefined ? undefined : workflowAgentResultExtensionName(profile.result);
-    const call: WorkflowAgentCallAuthority = {
-        extensions: available.extensions
-            .map((entry) => entry.name)
-            .filter(
-                (name) => name !== resultExtension && review.authority.extensions.includes(name),
-            ),
-        sections: available.sections
-            .map((entry) => entry.key)
-            .filter((key) => review.authority.sections.includes(key)),
-        tools: available.tools
-            .map((entry) => entry.name)
-            .filter(
-                (name) =>
-                    name !== profile.result?.toolName && review.authority.tools.includes(name),
-            ),
-        capabilities: available.capabilities.filter((capability) =>
-            review.authority.capabilities.includes(capability),
-        ),
-    };
-    const snapshot = workflowAgentProfileSnapshot(models, config, profile, call, registry);
-    const resultSchemaFingerprint =
-        profile.result === undefined ? null : workflowAgentResultSchemaFingerprint(profile.result);
-    const policyFingerprint = canonicalInput({
-        profileAllowlist: review.profileAllowlist,
-        authority: review.authority as unknown as JsonValue,
-    } as unknown as JsonValue).digest;
-    const identityInput = {
-        profileId,
-        profileFingerprint: snapshot.profileFingerprint,
-        modelFingerprint: snapshot.modelFingerprint,
-        authorityFingerprint: snapshot.authorityFingerprint,
-        policyFingerprint,
-        resultSchemaFingerprint,
-    };
-    const identity = {
-        ...identityInput,
-        fingerprint: canonicalInput(identityInput as unknown as JsonValue).digest,
-    };
-    const descriptor = freezeJson(
-        copyJson({
-            profile: { id: profile.id, version: profile.version },
-            instructions: {
-                text: profile.instructions,
-                version: profile.instructionsVersion,
-            },
-            model: { ...profile.model, fingerprint: snapshot.modelFingerprint },
-            authority: snapshot.authority,
-            ...(profile.result === undefined
-                ? {}
-                : {
-                      result: {
-                          ...profile.result,
-                          fingerprint: resultSchemaFingerprint!,
-                      },
-                  }),
-            identity,
-        } as unknown as JsonValue),
-    ) as unknown as WorkflowAgentReviewProfileDescriptor;
-
-    return { descriptor, snapshot };
-}
-
 function sameJson(left: JsonValue | undefined, right: JsonValue | undefined): boolean {
     if (left === undefined || right === undefined) {
         return left === right;
@@ -772,24 +479,21 @@ async function reserveTurn(
 
     assertReviewIdentityCurrent?.();
 
-    if (input.freshThread === true && thread.status !== "uninitialized") {
-        const turns = thread.turns ?? [];
-        const firstTurn = turns[0];
-
-        if (
-            turns.length === 0 ||
-            turns.filter((turn) => turn.turnId === input.turnId).length !== 1 ||
-            firstTurn?.turnId !== input.turnId ||
-            firstTurn.intentCanonical !== intent.canonical ||
-            firstTurn.intentDigest !== intent.digest ||
-            firstTurn.purpose !== "review" ||
-            firstTurn.freshThread !== true ||
-            !sameJson(firstTurn.reviewerIdentity, input.reviewerIdentity as unknown as JsonValue)
-        ) {
-            throw new WorkflowAgentAdmissionError(
-                "Fresh-thread admission requires an uninitialized thread or exact replay of its first turn",
-            );
-        }
+    if (
+        input.purpose === "review" &&
+        !workflowAgentReviewThreadAdmissionMatches(thread, {
+            turnId: input.turnId,
+            intentCanonical: intent.canonical,
+            intentDigest: intent.digest,
+            freshThread: input.freshThread,
+            reviewerIdentity: input.reviewerIdentity,
+        })
+    ) {
+        throw new WorkflowAgentAdmissionError(
+            input.freshThread === true
+                ? "Fresh-thread admission requires an uninitialized thread or exact replay of its first turn"
+                : "Review turns require fresh-thread admission or an admitted Review first turn",
+        );
     }
 
     if (thread.status === "uninitialized") {
@@ -1056,10 +760,7 @@ export function createWorkflowAgentTurnBinder(options: {
 
                 if (
                     resolved === undefined ||
-                    !sameJson(
-                        resolved.descriptor.identity as unknown as JsonValue,
-                        input.reviewerIdentity as unknown as JsonValue,
-                    )
+                    !workflowAgentReviewIdentityMatches(resolved, input.reviewerIdentity)
                 ) {
                     throw new WorkflowAgentAdmissionError(
                         "Resolved Review identity changed before turn reservation",
@@ -1153,16 +854,16 @@ export function createWorkflowAgentTurnBinder(options: {
         };
 
         return Object.assign(handler, {
-            resolveReviewProfile: (profileId: string) => {
+            resolveProfile: (profileId: string): JsonValue => {
                 const resolved = options.resolveReviewProfile?.(profileId);
 
                 if (resolved === undefined) {
                     throw new WorkflowAgentAdmissionError(
-                        "Review profile resolution is not configured",
+                        "Agent profile resolution is not configured",
                     );
                 }
 
-                return resolved.descriptor;
+                return resolved.descriptor as unknown as JsonValue;
             },
         });
     };
@@ -1445,12 +1146,11 @@ async function runAgentTurn(
     if (input.purpose === "review") {
         const review = resolveWorkflowAgentReviewProfile(models, config, input.profileId, registry);
 
-        reviewIdentityIsCurrent =
-            sameJson(
-                review.descriptor.identity as unknown as JsonValue,
-                input.reviewerIdentity as unknown as JsonValue,
-            ) &&
-            sameJson(review.snapshot.authority as unknown as JsonValue, input.effectiveAuthority);
+        reviewIdentityIsCurrent = workflowAgentReviewResolutionMatches(
+            review,
+            input.reviewerIdentity,
+            input.effectiveAuthority,
+        );
     }
 
     if (

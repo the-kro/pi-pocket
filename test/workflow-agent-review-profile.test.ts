@@ -13,11 +13,21 @@ import {
     createWorkflowAgentRuntime,
     workflowAgentThreadKey,
     type WorkflowAgentConfig,
+    type WorkflowAgentReviewProfileDescriptor,
 } from "../packages/workflow-runtime/index.ts";
 import { fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { defineWorkflow, type WorkflowContext } from "../packages/workflow-runtime/core/index.ts";
 
 const context = BACKGROUND_CONTEXT;
+
+async function resolvedReviewProfile(
+    agent: { resolveProfile(profileId: string): Promise<unknown> },
+    profileId: string,
+): Promise<WorkflowAgentReviewProfileDescriptor> {
+    return (await agent.resolveProfile(
+        profileId,
+    )) as unknown as WorkflowAgentReviewProfileDescriptor;
+}
 
 test("runtime resolves the allowlisted Review identity used by fresh-thread admission", async () => {
     const registry = createRegistry();
@@ -72,7 +82,7 @@ test("runtime resolves the allowlisted Review identity used by fresh-thread admi
         version: 1,
         async run({ agent }: WorkflowContext<null>) {
             assert.ok(agent);
-            const resolved = await agent.resolveReviewProfile(profile.id);
+            const resolved = await resolvedReviewProfile(agent, profile.id);
 
             assert.equal(resolved.profile.id, profile.id);
             assert.equal(resolved.profile.version, profile.version);
@@ -87,7 +97,7 @@ test("runtime resolves the allowlisted Review identity used by fresh-thread admi
             assert.equal(typeof resolved.identity.fingerprint, "string");
             assert.equal("tools" in resolved, false);
             assert.equal("nativeHandle" in resolved, false);
-            const schemaResolved = await agent.resolveReviewProfile(schemaProfile.id);
+            const schemaResolved = await resolvedReviewProfile(agent, schemaProfile.id);
 
             assert.equal(schemaResolved.result?.id, "review-result");
             assert.equal(
@@ -182,7 +192,7 @@ test("fresh Review admission rejects a pre-used thread atomically", async () => 
                 profile: profile.id,
                 content: "Use the existing thread.",
             });
-            const resolved = await agent.resolveReviewProfile(profile.id);
+            const resolved = await resolvedReviewProfile(agent, profile.id);
 
             return agent.turn({
                 threadId: "pre-used-review-thread",
@@ -217,6 +227,141 @@ test("fresh Review admission rejects a pre-used thread atomically", async () => 
         assert.equal(thread?.turns?.length, 1);
         assert.equal(thread?.turns?.[0]?.turnId, "existing-turn");
         assert.equal(faux.state.callCount, 1);
+    } finally {
+        await host.dispose();
+        await runtime.close();
+        await host.harness.close(context);
+    }
+});
+
+test("Review turns require fresh-thread admission for new and pre-used threads", async () => {
+    const registry = createRegistry();
+    const models = createModels();
+    const faux = fauxProvider();
+
+    models.setProvider(faux.provider);
+    faux.setResponses([
+        fauxAssistantMessage("existing omitted-flag thread"),
+        fauxAssistantMessage("review without omitted flag"),
+        fauxAssistantMessage("existing false-flag thread"),
+        fauxAssistantMessage("review without false flag"),
+        fauxAssistantMessage("existing omitted-flag continuation"),
+        fauxAssistantMessage("review on omitted-flag continuation"),
+        fauxAssistantMessage("existing false-flag continuation"),
+        fauxAssistantMessage("review on false-flag continuation"),
+    ]);
+    const model = models.getModel("faux", "faux-1")!;
+    const profile = {
+        id: "fresh-thread-required-reviewer",
+        version: 1,
+        instructions: "Review only.",
+        instructionsVersion: "review-v1",
+        model: {
+            provider: "faux",
+            modelId: "faux-1",
+            api: model.api,
+            providerVersion: "faux-review-v1",
+        },
+    };
+    const runtime = createWorkflowAgentRuntime({
+        harnessOptions: { models, registry },
+        agentConfig: {
+            profiles: [profile],
+            review: {
+                profileAllowlist: [profile.id],
+                authority: { extensions: [], sections: [], tools: [], capabilities: [] },
+            },
+        },
+    });
+
+    registry.install(runtime.extension);
+    const host = await runtime.openHost(new MemoryStorage(), context, () => undefined);
+    const cases = [
+        { threadId: "review-new-omitted", freshThread: undefined, preused: false },
+        { threadId: "review-new-false", freshThread: false, preused: false },
+        { threadId: "review-used-omitted", freshThread: undefined, preused: true },
+        { threadId: "review-used-false", freshThread: false, preused: true },
+    ] as const;
+    const workflow = defineWorkflow({
+        id: "review-fresh-thread-required",
+        version: 1,
+        async run({ agent }: WorkflowContext<null>) {
+            assert.ok(agent);
+            const resolved = await resolvedReviewProfile(agent, profile.id);
+            const outcomes: string[] = [];
+
+            for (const [index, scenario] of cases.entries()) {
+                if (scenario.preused) {
+                    await agent.turn({
+                        threadId: scenario.threadId,
+                        turnId: `existing-turn-${index}`,
+                        profile: profile.id,
+                        content: "Use an ordinary thread first.",
+                    });
+                }
+
+                const request = {
+                    threadId: scenario.threadId,
+                    turnId: `review-turn-${index}`,
+                    profile: profile.id,
+                    content: "Start or continue a Review without fresh-thread admission.",
+                    purpose: "review",
+                    reviewerIdentity: resolved.identity,
+                    ...(scenario.freshThread === undefined
+                        ? {}
+                        : { freshThread: scenario.freshThread }),
+                };
+
+                try {
+                    await agent.turn(request);
+                    outcomes.push("admitted");
+                } catch (error) {
+                    if (
+                        !(error instanceof Error) ||
+                        !/Review turns require fresh-thread admission/.test(error.message)
+                    ) {
+                        throw error;
+                    }
+
+                    outcomes.push("rejected");
+                }
+            }
+
+            return outcomes;
+        },
+    });
+
+    try {
+        runtime.engine.register(workflow);
+        await runtime.engine.start(
+            workflow,
+            null,
+            { runId: "review-fresh-thread-required-run" },
+            context,
+        );
+        const outcomes = await runtime.engine.wait("review-fresh-thread-required-run", context);
+
+        assert.deepEqual(outcomes, ["rejected", "rejected", "rejected", "rejected"]);
+        assert.equal(faux.state.callCount, 2);
+
+        for (const [index, scenario] of cases.entries()) {
+            const thread = await host.harness.snapshot(
+                AGENT_THREAD_DOC,
+                workflowAgentThreadKey({
+                    runId: "review-fresh-thread-required-run",
+                    threadId: scenario.threadId,
+                    profileId: profile.id,
+                }),
+                context,
+            );
+
+            if (scenario.preused) {
+                assert.equal(thread?.turns?.length, 1);
+                assert.equal(thread?.turns?.[0]?.turnId, `existing-turn-${index}`);
+            } else {
+                assert.equal(thread, undefined);
+            }
+        }
     } finally {
         await host.dispose();
         await runtime.close();
@@ -265,7 +410,7 @@ test("the exact first Review turn replays and later Review turns continue its th
         version: 1,
         async run({ agent }: WorkflowContext<null>) {
             assert.ok(agent);
-            const resolved = await agent.resolveReviewProfile(profile.id);
+            const resolved = await resolvedReviewProfile(agent, profile.id);
             const firstRequest = {
                 threadId: "continuing-review-thread",
                 turnId: "review-turn-one",
@@ -448,7 +593,7 @@ test("Review authority excludes a mutation-capable profile and guards nested eff
         version: 1,
         async run({ agent }: WorkflowContext<null>) {
             assert.ok(agent);
-            const resolved = await agent.resolveReviewProfile(profile.id);
+            const resolved = await resolvedReviewProfile(agent, profile.id);
 
             assert.deepEqual(
                 resolved.authority.tools.map((tool) => tool.name),
@@ -553,7 +698,7 @@ test("registry drift between Review resolution and admission rejects before thre
         version: 1,
         async run({ agent }: WorkflowContext<null>) {
             assert.ok(agent);
-            const resolved = await agent.resolveReviewProfile(profile.id);
+            const resolved = await resolvedReviewProfile(agent, profile.id);
 
             registry.install(
                 defineExtension({
@@ -652,10 +797,10 @@ test("forged identities and profiles outside the Review allowlist fail before ad
         async run({ agent }: WorkflowContext<null>) {
             assert.ok(agent);
             await assert.rejects(
-                agent.resolveReviewProfile(excludedProfile.id),
+                resolvedReviewProfile(agent, excludedProfile.id),
                 /not on the Review profile allowlist/,
             );
-            const resolved = await agent.resolveReviewProfile(allowedProfile.id);
+            const resolved = await resolvedReviewProfile(agent, allowedProfile.id);
 
             return agent.turn({
                 threadId: "forged-review-thread",

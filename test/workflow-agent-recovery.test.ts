@@ -16,19 +16,20 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
-import { createRegistry } from "@earendil-works/pi-durable";
+import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 
 const root = process.cwd();
 const mode = process.env.PI_REVIEW_MODE;
 const database = process.env.PI_REVIEW_DB;
 const markers = process.env.PI_REVIEW_MARKERS;
+const scenario = process.env.PI_REVIEW_RECOVERY_SCENARIO ?? "single-review";
 const context = BACKGROUND_CONTEXT;
 const runId = "review-recovery-run";
 const threadId = "review-recovery-thread";
 const profileId = "review-recovery-profile";
 
-function markDispatch() {
+function markDispatch(dispatch) {
     const descriptor = openSync(markers, "a");
 
     try {
@@ -38,7 +39,7 @@ function markDispatch() {
         closeSync(descriptor);
     }
 
-    writeSync(1, "REVIEW-DISPATCHED\n");
+    writeSync(1, "REVIEW-DISPATCHED-" + dispatch + "\n");
 }
 
 const { AGENT_THREAD_DOC, createWorkflowAgentRuntime, workflowAgentThreadKey } = await import(
@@ -51,14 +52,19 @@ const faux = fauxProvider();
 const models = createModels();
 const baseProvider = faux.provider;
 const api = "faux-review-recovery-v1";
+let providerDispatchCount = 0;
 const provider = {
     ...baseProvider,
     api,
     getModels: (...args) => baseProvider.getModels(...args).map((model) => ({ ...model, api })),
     streamSimple: (...args) => {
-        markDispatch();
+        providerDispatchCount += 1;
+        markDispatch(providerDispatchCount);
 
-        if (mode === "start") {
+        if (
+            mode === "start" &&
+            (scenario !== "tampered-first-review" || providerDispatchCount === 2)
+        ) {
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
         }
 
@@ -67,7 +73,14 @@ const provider = {
 };
 
 models.setProvider(provider);
-faux.setResponses([fauxAssistantMessage("recovered Review result")]);
+faux.setResponses(
+    scenario === "tampered-first-review" && mode === "start"
+        ? [
+              fauxAssistantMessage("first Review result"),
+              fauxAssistantMessage("recovered Review continuation"),
+          ]
+        : [fauxAssistantMessage("recovered Review result")],
+);
 const model = models.getModel("faux", "faux-1");
 const profile = {
     id: profileId,
@@ -92,9 +105,8 @@ const workflow = defineWorkflow({
     id: "review-recovery-workflow",
     version: 1,
     async run({ agent }) {
-        const resolved = await agent.resolveReviewProfile(profileId);
-
-        return agent.turn({
+        const resolved = await agent.resolveProfile(profileId);
+        const firstTurn = {
             threadId,
             turnId: "review-first-turn",
             profile: profileId,
@@ -102,34 +114,88 @@ const workflow = defineWorkflow({
             purpose: "review",
             reviewerIdentity: resolved.identity,
             freshThread: true,
-        });
+        };
+
+        if (scenario === "tampered-first-review") {
+            await agent.turn(firstTurn);
+
+            return agent.turn({
+                ...firstTurn,
+                turnId: "review-second-turn",
+                content: "Continue reviewing the evidence.",
+                freshThread: false,
+            });
+        }
+
+        return agent.turn(firstTurn);
     },
 });
 runtime.register(workflow);
 const storage = await openNodeSqliteStorage(database);
-const host = await runtime.openHost(storage, context, () => undefined);
 
-if (mode === "start") {
-    await runtime.engine.start(workflow, null, { runId }, context);
-    await new Promise(() => {});
+if (mode === "tamper") {
+    const harness = await Harness.open(storage, { models, registry }, context);
+    const key = workflowAgentThreadKey({ runId, threadId, profileId });
+
+    await harness.commit(async (tx) => {
+        const current = await tx.doc(AGENT_THREAD_DOC, key, key);
+        const firstTurn = current.turns?.[0];
+
+        if (firstTurn?.turnId !== "review-first-turn") {
+            throw new Error("Cannot tamper a missing persisted first Review turn");
+        }
+
+        Reflect.deleteProperty(firstTurn, "purpose");
+        Reflect.deleteProperty(firstTurn, "reviewerIdentity");
+        Reflect.deleteProperty(firstTurn, "freshThread");
+    }, context);
+
+    await harness.close(context);
+    writeSync(1, "TAMPERED:first-review-turn\\n");
 } else {
-    const result = await runtime.engine.wait(runId, context);
-    const thread = await host.harness.snapshot(
-        AGENT_THREAD_DOC,
-        workflowAgentThreadKey({ runId, threadId, profileId }),
-        context,
-    );
+    const host = await runtime.openHost(storage, context, () => undefined);
 
-    writeSync(1, "FINAL:" + JSON.stringify({ result, thread }) + String.fromCharCode(10));
-    await host.dispose();
-    await runtime.close();
-    await host.harness.close(context);
+    if (mode === "start") {
+        await runtime.engine.start(workflow, null, { runId }, context);
+        await new Promise(() => {});
+    } else {
+        let result;
+        let failure;
+
+        try {
+            result = await runtime.engine.wait(runId, context);
+        } catch (error) {
+            failure = {
+                name: error instanceof Error ? error.name : "UnknownError",
+                message: error instanceof Error ? error.message : String(error),
+            };
+        }
+
+        const thread = await host.harness.snapshot(
+            AGENT_THREAD_DOC,
+            workflowAgentThreadKey({ runId, threadId, profileId }),
+            context,
+        );
+
+        writeSync(
+            1,
+            "FINAL:" + JSON.stringify({ result, failure, thread }) + String.fromCharCode(10),
+        );
+        await host.dispose();
+        await runtime.close();
+        await host.harness.close(context);
+    }
 }
 `;
 
 type Worker = { readonly child: ChildProcess; output: string; errors: string };
 
-function startReviewWorker(mode: "start" | "recover", database: string, markers: string): Worker {
+function startReviewWorker(
+    mode: "start" | "recover" | "tamper",
+    database: string,
+    markers: string,
+    scenario = "single-review",
+): Worker {
     const child = spawn(
         process.execPath,
         ["--experimental-strip-types", "--input-type=module", "-e", reviewCrashWorkerSource],
@@ -140,6 +206,7 @@ function startReviewWorker(mode: "start" | "recover", database: string, markers:
                 PI_REVIEW_MODE: mode,
                 PI_REVIEW_DB: database,
                 PI_REVIEW_MARKERS: markers,
+                PI_REVIEW_RECOVERY_SCENARIO: scenario,
             },
             stdio: ["ignore", "pipe", "pipe"],
         },
@@ -334,6 +401,71 @@ test("reopen replays an exact fresh Review first turn with its persisted identit
         ]);
     } finally {
         await killWorker(first);
+
+        if (recovery !== undefined && recovery.child.exitCode === null) {
+            await killWorker(recovery);
+        }
+
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("recovery fences a Review continuation whose first turn lost freshness admission", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-pocket-agent-review-freshness-recovery-"));
+    const database = join(directory, "agent.sqlite");
+    const markers = join(directory, "provider-dispatches.log");
+    const scenario = "tampered-first-review";
+    const first = startReviewWorker("start", database, markers, scenario);
+    let tamper: Worker | undefined;
+    let recovery: Worker | undefined;
+
+    try {
+        await outputUntil(first, "REVIEW-DISPATCHED-2");
+        await killWorker(first);
+        assert.deepEqual(await dispatchMarkers(markers), [
+            "provider-dispatch",
+            "provider-dispatch",
+        ]);
+
+        tamper = startReviewWorker("tamper", database, markers, scenario);
+        const tampered = await outputUntil(tamper, "TAMPERED:");
+
+        await successfulExit(tamper);
+        assert.match(tampered, /TAMPERED:first-review-turn/);
+
+        recovery = startReviewWorker("recover", database, markers, scenario);
+        const output = await outputUntil(recovery, "FINAL:");
+
+        await successfulExit(recovery);
+
+        const final = payloadAfter(output, "FINAL:") as {
+            readonly failure?: { readonly message: string };
+            readonly thread: {
+                readonly status: string;
+                readonly turns: readonly {
+                    readonly status: string;
+                    readonly purpose?: string;
+                    readonly freshThread?: boolean;
+                }[];
+            };
+        };
+
+        assert.ok(final.failure);
+        assert.equal(final.thread.status, "unknown");
+        assert.equal(final.thread.turns[0]?.purpose, undefined);
+        assert.equal(final.thread.turns[1]?.purpose, "review");
+        assert.equal(final.thread.turns[1]?.freshThread, false);
+        assert.equal(final.thread.turns[1]?.status, "unknown");
+        assert.deepEqual(await dispatchMarkers(markers), [
+            "provider-dispatch",
+            "provider-dispatch",
+        ]);
+    } finally {
+        await killWorker(first);
+
+        if (tamper !== undefined && tamper.child.exitCode === null) {
+            await killWorker(tamper);
+        }
 
         if (recovery !== undefined && recovery.child.exitCode === null) {
             await killWorker(recovery);

@@ -13,6 +13,7 @@ import { fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createRegistry, defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import * as workflowRuntime from "../../packages/workflow-runtime/index.ts";
+import type { WorkflowAgentReviewProfileDescriptor } from "../../packages/workflow-runtime/index.ts";
 import {
     defineWorkflow,
     type WorkflowContext,
@@ -437,7 +438,9 @@ const workflow = defineWorkflow({
         }
 
         const originalAgent = workflowContext.agent;
-        const resolvedProfile = await originalAgent.resolveReviewProfile(profileId);
+        const resolvedProfile = (await originalAgent.resolveProfile(
+            profileId,
+        )) as unknown as WorkflowAgentReviewProfileDescriptor;
         const verificationA: VerificationResult =
             scenario !== "single-review"
                 ? await durableVerification(
