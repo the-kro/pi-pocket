@@ -322,9 +322,10 @@ test("changed request identities after completed results reject before command r
         await successfulExit(recovery);
 
         assert.deepEqual(payloadAfter<string[]>(recoveryOutput, "CONFLICTS:"), variants);
+        // Recovered runs emit independently; conflict order follows scheduling, not request order.
         assert.deepEqual(
-            [...recoveryOutput.matchAll(/^CONFLICT:([^\r\n]+)$/gm)].map((match) => match[1]),
-            variants,
+            [...recoveryOutput.matchAll(/^CONFLICT:([^\r\n]+)$/gm)].map((match) => match[1]).sort(),
+            [...variants].sort(),
         );
         assert.deepEqual(
             await dispatchMarkers(directory),

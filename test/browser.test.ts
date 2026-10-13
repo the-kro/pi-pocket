@@ -649,11 +649,15 @@ test(
 
             // Everyone who sees the session watches; only people who can steer use the page, and files are the owner's.
             await request(app.config.ownerToken, `c/${id}/browser/navigate`, { url: `${base}/` });
-            const state = (await (await request(viewer.token, `c/${id}/browser`)).json()) as {
-                open: boolean;
-            };
+            await until(async () => {
+                const state = (await (await request(viewer.token, `c/${id}/browser`)).json()) as {
+                    open: boolean;
+                    url: string;
+                    loading: boolean;
+                };
 
-            assert.equal(state.open, true);
+                return state.open && state.url === `${base}/` && !state.loading;
+            }, "the browser panel page to finish navigating");
             const frame = await request(viewer.token, `c/${id}/browser/frame?after=0`);
 
             assert.equal(frame.status, 200);
