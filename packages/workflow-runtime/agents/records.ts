@@ -4,6 +4,31 @@ import { defineDocFamily } from "@earendil-works/pi-durable";
 export type AgentThreadStatus = "uninitialized" | "ready" | "unknown" | "closed";
 export type AgentTurnStatus = "reserved" | "submitted" | "completed" | "not-completed" | "unknown";
 
+export type AgentTurnResultSchema = {
+    readonly id: string;
+    readonly version: string;
+    readonly toolName: string;
+    readonly fingerprint: string;
+};
+
+export type AgentStructuredResultCandidate = {
+    readonly runId: string;
+    readonly threadKey: string;
+    readonly threadId: string;
+    readonly turnId: string;
+    readonly conversationId: number;
+    readonly requestId: string;
+    readonly submissionId: number;
+    readonly assistantEntryId: number;
+    readonly callId: string;
+    readonly toolTaskId: number;
+    readonly generationTaskId: number;
+    readonly schemaId: string;
+    readonly schemaVersion: string;
+    readonly schemaFingerprint: string;
+    readonly payload: JsonValue;
+};
+
 export type AgentTurnRecord = {
     readonly turnId: string;
     readonly intentCanonical: string;
@@ -12,11 +37,19 @@ export type AgentTurnRecord = {
     readonly modelFingerprint: string;
     readonly profileInput: JsonValue;
     readonly modelInput: JsonValue;
+    readonly authorityFingerprint: string;
+    readonly authorityInput: JsonValue;
+    readonly effectiveAuthority: JsonValue;
+    readonly purpose?: "review";
+    readonly reviewerIdentity?: JsonValue;
+    readonly freshThread?: boolean;
     readonly requestId: string;
+    readonly resultSchema?: AgentTurnResultSchema;
     status: AgentTurnStatus;
     runnerTaskId?: number;
     submissionId?: number;
     answerEntryId?: number;
+    candidate?: AgentStructuredResultCandidate;
     result?: JsonValue;
 };
 
@@ -32,6 +65,8 @@ export type AgentThreadRecord = {
     readonly providerSessionId: string;
     readonly profileFingerprint: string;
     readonly modelFingerprint: string;
+    readonly authorityFingerprint?: string;
+    readonly authorityInput?: JsonValue;
     readonly ownerTaskId?: number;
     readonly profileInput?: JsonValue;
     readonly modelInput?: JsonValue;

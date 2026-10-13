@@ -12,11 +12,14 @@ import {
     createRegistry,
     defineExtension,
     defineTool,
+    AgentDoc,
     Harness,
+    ProviderDoc,
     UserEntry,
     type ConversationId,
     type Storage,
     type StorageWrite,
+    section,
 } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import {
@@ -48,7 +51,14 @@ if (
         mode !== "tamper-owner-id" &&
         mode !== "tamper-workflow-task-id" &&
         mode !== "abort-owner" &&
-        mode !== "terminal-runner") ||
+        mode !== "terminal-runner" &&
+        mode !== "orphan-missing-provider" &&
+        mode !== "orphan-missing-thread-and-provider" &&
+        mode !== "tamper-result-payload" &&
+        mode !== "tamper-result-schema" &&
+        mode !== "tamper-result-assistant" &&
+        mode !== "tamper-result-submission" &&
+        mode !== "tamper-result-task") ||
     database === undefined ||
     markerFile === undefined ||
     boundary === undefined
@@ -114,6 +124,34 @@ function hasTurnStatus(value: unknown, status: string): boolean {
                 turn.status === status,
         )
     );
+}
+
+function markCrashTurnNotCompleted(value: unknown): Record<string, unknown> | undefined {
+    if (typeof value !== "object" || value === null || !("turns" in value)) {
+        return undefined;
+    }
+
+    const copy = structuredClone(value) as Record<string, unknown>;
+
+    if (!Array.isArray(copy.turns)) {
+        return undefined;
+    }
+
+    const turn = copy.turns.find(
+        (candidate): candidate is Record<string, unknown> =>
+            typeof candidate === "object" &&
+            candidate !== null &&
+            "turnId" in candidate &&
+            candidate.turnId === "crash-turn",
+    );
+
+    if (turn?.status !== "reserved") {
+        return undefined;
+    }
+
+    turn.status = "not-completed";
+
+    return copy;
 }
 
 const faux = fauxProvider();
@@ -224,6 +262,26 @@ const unsafeToolResponse = fauxAssistantMessage(
 );
 
 function fixtureResponses() {
+    if (
+        boundary === "result-candidate-committed" ||
+        boundary === "result-tool-settled" ||
+        boundary === "result-native-answer" ||
+        boundary === "result-adapter-promoted"
+    ) {
+        return [
+            fauxAssistantMessage(
+                [
+                    fauxToolCall(
+                        "submit_crash_result",
+                        { answer: "literal crash result", score: 11 },
+                        { id: "crash-result-call" },
+                    ),
+                ],
+                { stopReason: "toolUse" },
+            ),
+        ];
+    }
+
     if (boundary === "later-provider-dispatched") {
         return mode === "recover"
             ? [fauxAssistantMessage("saved after the later dispatch")]
@@ -242,7 +300,7 @@ function fixtureResponses() {
         ];
     }
 
-    if (boundary === "tool-dispatched") {
+    if (boundary === "tool-dispatched" || boundary === "agent-selection-malformed-safe-tool") {
         return [fauxAssistantMessage("first settled native turn"), unsafeToolResponse];
     }
 
@@ -296,15 +354,83 @@ const profile = {
         api: model.api,
         providerVersion: "faux-process-test-v1",
     },
+    extensions: [{ name: "crash-fixture-unsafe-effect", version: "unsafe-effect-extension-v1" }],
+    ...(boundary === "section-view-submission-committed"
+        ? {
+              sections: [
+                  {
+                      key: "crash-section-alpha",
+                      extension: "crash-fixture-unsafe-effect",
+                      version: "crash-section-alpha-v1",
+                  },
+                  {
+                      key: "crash-section-beta",
+                      extension: "crash-fixture-unsafe-effect",
+                      version: "crash-section-beta-v1",
+                  },
+              ],
+          }
+        : {}),
+    tools: [
+        {
+            name: "unsafe_effect",
+            extension: "crash-fixture-unsafe-effect",
+            version: "unsafe-effect-tool-v1",
+            capabilities: ["fixture.effect"],
+        },
+    ],
+    capabilities: ["fixture.effect"],
+    ...(boundary === "result-candidate-committed" ||
+    boundary === "result-tool-settled" ||
+    boundary === "result-native-answer" ||
+    boundary === "result-adapter-promoted"
+        ? {
+              result: {
+                  id: "crash-fixture-result",
+                  version: "1",
+                  toolName: "submit_crash_result",
+                  schema: {
+                      type: "object",
+                      properties: {
+                          answer: { type: "string" },
+                          score: { type: "integer" },
+                      },
+                      required: ["answer", "score"],
+                      additionalProperties: false,
+                  },
+              },
+          }
+        : {}),
 } as const;
 const registry = createRegistry();
 const unsafeEffect = defineTool({
     name: "unsafe_effect",
     description: "Record one test side effect before returning.",
     parameters: Type.Object({ label: Type.String() }),
-    replay: "unsafe",
+    replay: boundary === "agent-selection-malformed-safe-tool" ? "safe" : "unsafe",
     execute: async (args) => {
         durableToolDispatchMarker();
+
+        if (mode === "start" && boundary === "agent-selection-malformed-safe-tool") {
+            if (malformedAgentSelectionConversationId === undefined) {
+                throw new Error("Safe-tool fixture has no conversation to corrupt");
+            }
+
+            await harness.commit(async (tx) => {
+                const agent = await tx.doc(
+                    AgentDoc,
+                    malformedAgentSelectionConversationId as ConversationId,
+                );
+
+                agent.extensions = [
+                    unsafeEffectExtension.name,
+                    "missing-agent-extension",
+                    unsafeEffectExtension.name,
+                ];
+                agent.tools = ["unsafe_effect", "missing-agent-tool", "unsafe_effect"];
+            }, context);
+            controlledBoundary(boundary);
+        }
 
         if (mode === "start" && boundary === "tool-dispatched") {
             controlledBoundary("tool-dispatched");
@@ -320,7 +446,32 @@ const unsafeEffect = defineTool({
 const unsafeEffectExtension = defineExtension({
     name: "crash-fixture-unsafe-effect",
     tools: [unsafeEffect],
+    ...(boundary === "section-view-submission-committed"
+        ? {
+              sections: [
+                  section("crash-section-alpha", () => "CRASH_SECTION_ALPHA"),
+                  section("crash-section-beta", () => "CRASH_SECTION_BETA_PRIVATE"),
+              ],
+          }
+        : {}),
 });
+
+function malformedAgentSelection(value: unknown): Record<string, unknown> | undefined {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return undefined;
+    }
+
+    const copy = structuredClone(value) as Record<string, unknown>;
+
+    copy.extensions = [
+        unsafeEffectExtension.name,
+        "missing-agent-extension",
+        unsafeEffectExtension.name,
+    ];
+    copy.tools = ["unsafe_effect", "missing-agent-tool", "unsafe_effect"];
+
+    return copy;
+}
 
 registry.install(unsafeEffectExtension);
 const originalStorage = await openNodeSqliteStorage(database);
@@ -340,9 +491,15 @@ const storage = new Proxy(originalStorage, {
                         typeof write.value.requestId === "string" &&
                         write.value.requestId.startsWith("pocket-workflow-agent-turn-v1:"),
                 );
-                const runnerCreated = writes.some(
+                const runnerWrite = writes.find(
                     (write) => write.type === "task" && write.value.kind === AGENT_RUNNER_TASK_NAME,
-                );
+                ) as Extract<StorageWrite, { type: "task" }> | undefined;
+                const runnerCreated = runnerWrite !== undefined;
+                const runnerConversationId =
+                    runnerWrite === undefined
+                        ? undefined
+                        : (runnerWrite.value.input as { readonly conversationId?: unknown })
+                              .conversationId;
                 const threadCreated = writes.some(
                     (write) =>
                         write.type === "document.create" &&
@@ -365,7 +522,252 @@ const storage = new Proxy(originalStorage, {
                     controlledBoundary("before-intent-commit");
                 }
 
-                const sequence = await target.commit(writes, commitContext);
+                let classifiedNotCompletedTurn = false;
+                const committedWrites = [...writes];
+
+                if (mode === "start" && boundary === "turn-not-completed-classified") {
+                    for (let index = 0; index < writes.length; index += 1) {
+                        const write = writes[index];
+
+                        if (write?.type === "document.create") {
+                            if (write.record.kind !== AGENT_THREAD_DOC.definition.kind) {
+                                continue;
+                            }
+
+                            const value = markCrashTurnNotCompleted(write.content.value);
+
+                            if (value !== undefined) {
+                                committedWrites[index] = {
+                                    ...write,
+                                    content: {
+                                        ...write.content,
+                                        value: value as typeof write.content.value,
+                                    },
+                                };
+                                classifiedNotCompletedTurn = true;
+                                break;
+                            }
+                        }
+
+                        if (write?.type === "document.change") {
+                            const stored = await target.document(
+                                write.id,
+                                "current",
+                                commitContext,
+                            );
+
+                            if (
+                                stored?.record.kind !== AGENT_THREAD_DOC.definition.kind ||
+                                write.content.kind !== "delta"
+                            ) {
+                                continue;
+                            }
+
+                            const turns =
+                                (stored.value as unknown as AgentThreadRecord).turns ?? [];
+                            const turnIndex = turns.findIndex(
+                                (turn) => turn.turnId === "crash-turn",
+                            );
+
+                            if (turnIndex < 0) {
+                                continue;
+                            }
+
+                            const ops = write.content.ops.map((operation) => {
+                                const tuple = operation as unknown as unknown[];
+                                const path = tuple[1];
+
+                                if (
+                                    tuple[0] === "s" &&
+                                    Array.isArray(path) &&
+                                    path[0] === "turns" &&
+                                    path[1] === turnIndex &&
+                                    path[2] === "status" &&
+                                    tuple[2] === "reserved"
+                                ) {
+                                    classifiedNotCompletedTurn = true;
+
+                                    return [tuple[0], path, "not-completed"];
+                                }
+
+                                return operation;
+                            });
+
+                            if (classifiedNotCompletedTurn) {
+                                committedWrites[index] = {
+                                    ...write,
+                                    content: {
+                                        ...write.content,
+                                        ops: ops as unknown as typeof write.content.ops,
+                                    },
+                                };
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let malformedAgentSelectionCommitted = false;
+
+                if (
+                    mode === "start" &&
+                    boundary === "agent-selection-malformed-committed" &&
+                    typeof runnerConversationId === "number"
+                ) {
+                    const extensions = [
+                        unsafeEffectExtension.name,
+                        "missing-agent-extension",
+                        unsafeEffectExtension.name,
+                    ];
+                    const tools = ["unsafe_effect", "missing-agent-tool", "unsafe_effect"];
+
+                    for (let index = 0; index < writes.length; index += 1) {
+                        const write = writes[index];
+
+                        if (write?.type === "document.create") {
+                            if (
+                                write.record.kind !== AgentDoc.definition.kind ||
+                                write.record.scope.kind !== "conversation" ||
+                                Number(write.record.scope.conversationId) !==
+                                    Number(runnerConversationId) ||
+                                write.content.kind !== "base"
+                            ) {
+                                continue;
+                            }
+
+                            const value = malformedAgentSelection(write.content.value);
+
+                            if (value !== undefined) {
+                                committedWrites[index] = {
+                                    ...write,
+                                    content: {
+                                        ...write.content,
+                                        value: value as typeof write.content.value,
+                                    },
+                                };
+                                malformedAgentSelectionCommitted = true;
+                            }
+
+                            continue;
+                        }
+
+                        if (write?.type !== "document.change") {
+                            continue;
+                        }
+
+                        const stored = await target.document(write.id, "current", commitContext);
+
+                        if (
+                            stored?.record.kind !== AgentDoc.definition.kind ||
+                            stored.record.scope.kind !== "conversation" ||
+                            Number(stored.record.scope.conversationId) !==
+                                Number(runnerConversationId)
+                        ) {
+                            continue;
+                        }
+
+                        if (write.content.kind === "base") {
+                            const value = malformedAgentSelection(write.content.value);
+
+                            if (value !== undefined) {
+                                committedWrites[index] = {
+                                    ...write,
+                                    content: {
+                                        ...write.content,
+                                        value: value as typeof write.content.value,
+                                    },
+                                };
+                                malformedAgentSelectionCommitted = true;
+                            }
+
+                            continue;
+                        }
+
+                        const ops = [
+                            ...write.content.ops,
+                            ["s", ["extensions"], extensions],
+                            ["s", ["tools"], tools],
+                        ] as typeof write.content.ops;
+
+                        committedWrites[index] = {
+                            ...write,
+                            content: { ...write.content, ops },
+                        };
+                        malformedAgentSelectionCommitted = true;
+                    }
+                }
+
+                const sequence = await target.commit(committedWrites, commitContext);
+
+                if (classifiedNotCompletedTurn) {
+                    controlledBoundary("turn-not-completed-classified");
+                }
+
+                if (
+                    malformedAgentSelectionCommitted &&
+                    boundary === "agent-selection-malformed-committed"
+                ) {
+                    controlledBoundary("agent-selection-malformed-committed");
+                }
+
+                if (
+                    mode === "start" &&
+                    (boundary === "result-candidate-committed" ||
+                        boundary === "result-adapter-promoted")
+                ) {
+                    for (const write of writes) {
+                        if (write.type !== "document.change") {
+                            continue;
+                        }
+
+                        const stored = await target.document(write.id, "current", commitContext);
+
+                        if (stored?.record.kind !== AGENT_THREAD_DOC.definition.kind) {
+                            continue;
+                        }
+
+                        const turns = (stored.value as unknown as AgentThreadRecord).turns ?? [];
+                        const matched = turns.some(
+                            (turn) =>
+                                turn.turnId === "crash-turn" &&
+                                turn.candidate !== undefined &&
+                                (boundary !== "result-adapter-promoted" ||
+                                    turn.status === "completed"),
+                        );
+
+                        if (matched) {
+                            controlledBoundary(boundary);
+                        }
+                    }
+                }
+
+                if (
+                    mode === "start" &&
+                    boundary === "result-tool-settled" &&
+                    writes.some(
+                        (write) =>
+                            write.type === "task" &&
+                            write.value.kind === "pi.tool" &&
+                            write.value.state.status === "terminal" &&
+                            write.value.state.outcome.status === "completed" &&
+                            (
+                                write.value.state.outcome.result as {
+                                    control?: { terminate?: boolean };
+                                }
+                            ).control?.terminate === true,
+                    )
+                ) {
+                    controlledBoundary(boundary);
+                }
+
+                if (
+                    mode === "start" &&
+                    boundary === "result-native-answer" &&
+                    done?.type === "submission" &&
+                    done.value.requestId?.startsWith("pocket-workflow-agent-turn-v1:")
+                ) {
+                    controlledBoundary(boundary);
+                }
 
                 if (mode === "start" && boundary === "tool-effect-then-fail" && failedTool) {
                     controlledBoundary("tool-effect-then-fail");
@@ -408,7 +810,8 @@ const storage = new Proxy(originalStorage, {
 
                 if (
                     mode === "start" &&
-                    boundary === "submission-committed" &&
+                    (boundary === "submission-committed" ||
+                        boundary === "section-view-submission-committed") &&
                     nativeSubmission?.type === "submission"
                 ) {
                     controlledBoundary(
@@ -443,6 +846,40 @@ const storage = new Proxy(originalStorage, {
         return typeof value === "function" ? value.bind(target) : value;
     },
 }) as Storage;
+let nativeAgentResolutionAttempted = false;
+let malformedAgentConversationId: number | undefined;
+let malformedAgentSelectionConversationId: number | undefined;
+
+if (mode === "recover" && boundary === "agent-selection-malformed-safe-tool") {
+    const threadKey = workflowAgentThreadKey({
+        runId: "agent-crash-run",
+        threadId: "crash-thread",
+        profileId: profile.id,
+    });
+    const documents = await originalStorage.scanDocuments(
+        {
+            scope: { kind: "session" },
+            at: "current",
+            kind: AGENT_THREAD_DOC.definition.kind,
+        },
+        100,
+        undefined,
+        context,
+    );
+    const threadDocument = documents.items.find((document) => document.key === threadKey);
+    const thread =
+        threadDocument === undefined
+            ? undefined
+            : await originalStorage.document(threadDocument.id, "current", context);
+    const record = thread?.value as unknown as AgentThreadRecord | undefined;
+
+    if (typeof record?.conversationId !== "number") {
+        throw new Error("Safe-tool recovery fixture has no malformed-selection conversation");
+    }
+
+    malformedAgentConversationId = record.conversationId;
+}
+
 let startupSetup: WorkflowAgentHostSetup | undefined;
 let stopDuringTimerScan: Promise<void> | undefined;
 const runtime = createWorkflowAgentRuntime({
@@ -462,7 +899,17 @@ const runtime = createWorkflowAgentRuntime({
               }
             : {}),
     },
-    agentConfig: { profiles: [profile] },
+    agentConfig: {
+        authority: {
+            extensions: ["crash-fixture-unsafe-effect"],
+            ...(boundary === "section-view-submission-committed"
+                ? { sections: ["crash-section-alpha", "crash-section-beta"] }
+                : {}),
+            tools: ["unsafe_effect"],
+            capabilities: ["fixture.effect"],
+        },
+        profiles: [profile],
+    },
     ...(mode === "recover" && boundary === "timer-open-race"
         ? {
               timerOptions: {
@@ -527,6 +974,7 @@ const workflow = defineWorkflow({
             boundary === "later-provider-dispatched" ||
             boundary === "compaction-dispatched" ||
             boundary === "tool-dispatched" ||
+            boundary === "agent-selection-malformed-safe-tool" ||
             boundary === "tool-effect-then-fail" ||
             boundary === "later-provider-after-tool" ||
             boundary === "tool-round-prepare"
@@ -542,6 +990,7 @@ const workflow = defineWorkflow({
         if (
             mode === "start" &&
             (boundary === "tool-dispatched" ||
+                boundary === "agent-selection-malformed-safe-tool" ||
                 boundary === "tool-effect-then-fail" ||
                 boundary === "later-provider-after-tool" ||
                 boundary === "tool-round-prepare")
@@ -557,8 +1006,12 @@ const workflow = defineWorkflow({
                     ? undefined
                     : await harness.conversation(thread.conversationId as never, context);
 
-            if (conversation === undefined) {
+            if (thread === undefined || conversation === undefined) {
                 throw new Error("Cannot configure the crash-fixture agent conversation");
+            }
+
+            if (boundary === "agent-selection-malformed-safe-tool") {
+                malformedAgentSelectionConversationId = Number(thread.conversationId);
             }
 
             await conversation.configure(
@@ -575,6 +1028,9 @@ const workflow = defineWorkflow({
                 boundary === "compaction-dispatched"
                     ? "x ".repeat(2_000)
                     : "Produce the saved result.",
+            ...(boundary === "section-view-submission-committed"
+                ? { sections: ["crash-section-alpha"] }
+                : {}),
         });
     },
 });
@@ -593,6 +1049,7 @@ let hostDispose: (() => Promise<void>) | undefined;
 let unsubscribe = () => {};
 
 let preopen: AgentThreadRecord | undefined;
+let recoveredRunnerId: number | undefined;
 let nativeTasks: {
     id: number;
     owner?: number;
@@ -607,6 +1064,43 @@ let nativeTasks: {
 
 if (mode === "start" || mode === "recover") {
     runtime.register(workflow);
+
+    if (
+        mode === "recover" &&
+        boundary === "agent-selection-malformed-safe-tool" &&
+        malformedAgentConversationId !== undefined
+    ) {
+        const originalHarnessOpen = Harness.open;
+
+        Harness.open = async (storage, options, openContext) => {
+            const opened = await originalHarnessOpen(storage, options, openContext);
+            const originalConversation = opened.conversation.bind(opened);
+
+            opened.conversation = async (conversationId, conversationContext) => {
+                const conversation = await originalConversation(
+                    conversationId,
+                    conversationContext,
+                );
+
+                if (
+                    conversation !== undefined &&
+                    Number(conversationId) === malformedAgentConversationId
+                ) {
+                    conversation.agent = async () => {
+                        nativeAgentResolutionAttempted = true;
+
+                        throw new Error(
+                            "Fixture detected native Agent resolution after selection validation failed",
+                        );
+                    };
+                }
+
+                return conversation;
+            };
+
+            return opened;
+        };
+    }
 
     if (boundary === "timer-open-race") {
         runtime.register(timerScanWorkflow);
@@ -651,8 +1145,92 @@ if (mode === "start" || mode === "recover") {
                 profileId: profile.id,
             });
             const beforeAttach = await setup.snapshot(AGENT_THREAD_DOC, key, context);
+            const runnerPage = await storage.scanTasks(
+                { kind: AGENT_RUNNER_TASK_NAME },
+                100,
+                undefined,
+                context,
+            );
+            const persistedRunner = runnerPage.items.find((candidate) => {
+                const input = candidate.input as {
+                    runId?: unknown;
+                    threadId?: unknown;
+                    profileId?: unknown;
+                };
 
-            if (boundary === "tamper-turn-submission-id") {
+                return (
+                    input.runId === "agent-crash-run" &&
+                    input.threadId === "crash-thread" &&
+                    input.profileId === profile.id
+                );
+            });
+
+            recoveredRunnerId =
+                persistedRunner === undefined ? undefined : Number(persistedRunner.id);
+            const runnerBeforeRecovery =
+                persistedRunner === undefined
+                    ? undefined
+                    : await setup.getTask(persistedRunner.id as never);
+            const ownerTaskId = beforeAttach?.ownerTaskId ?? persistedRunner?.owner;
+            const ownerBeforeRecovery =
+                ownerTaskId === undefined ? undefined : await setup.getTask(ownerTaskId as never);
+            const runBeforeRecovery = await setup.snapshot(RUN_DOC, "agent-crash-run", context);
+            const agentConversationId =
+                beforeAttach?.conversationId ??
+                (typeof (persistedRunner?.input as { conversationId?: unknown } | undefined)
+                    ?.conversationId === "number"
+                    ? ((persistedRunner?.input as { conversationId: number })
+                          .conversationId as ConversationId)
+                    : undefined);
+            const providerBeforeRecovery =
+                agentConversationId === undefined
+                    ? undefined
+                    : await setup.snapshot(
+                          ProviderDoc,
+                          agentConversationId as ConversationId,
+                          context,
+                      );
+            const agentBeforeRecovery =
+                agentConversationId === undefined
+                    ? undefined
+                    : await setup.snapshot(
+                          AgentDoc,
+                          agentConversationId as ConversationId,
+                          context,
+                      );
+            const conversationsBeforeRecovery = await setup.scanConversations({}, 100);
+            const nativeConversationBeforeRecovery = conversationsBeforeRecovery.items.find(
+                (conversation) => conversation.id === agentConversationId,
+            );
+
+            process.stdout.write(
+                `PRE-RECOVERY:${JSON.stringify({
+                    threadStatus: beforeAttach?.status,
+                    turnStatus: beforeAttach?.turns?.[0]?.status,
+                    runnerStatus: runnerBeforeRecovery?.state.status,
+                    runnerAbortRequested: runnerBeforeRecovery?.abortRequested,
+                    ownerStatus: ownerBeforeRecovery?.state.status,
+                    ownerAbortRequested: ownerBeforeRecovery?.abortRequested,
+                    ownerTaskId: ownerBeforeRecovery?.id,
+                    ownerConversationId: ownerBeforeRecovery?.conversationId,
+                    ownerRunId: (ownerBeforeRecovery?.input as { runId?: unknown } | undefined)
+                        ?.runId,
+                    runStatus: runBeforeRecovery?.status,
+                    runTaskId: runBeforeRecovery?.taskId,
+                    runHasStopCommand: runBeforeRecovery?.stopCommand !== undefined,
+                    runHasSelectedOutcome: runBeforeRecovery?.selectedOutcome !== undefined,
+                    threadProviderSessionId: beforeAttach?.providerSessionId,
+                    providerSessionId: providerBeforeRecovery?.sessionId,
+                    agentExtensions: agentBeforeRecovery?.extensions,
+                    agentTools: agentBeforeRecovery?.tools,
+                    nativeConversationOwner: nativeConversationBeforeRecovery?.owner,
+                })}${String.fromCharCode(10)}`,
+            );
+
+            if (
+                boundary === "tamper-turn-submission-id" ||
+                boundary === "tamper-turn-submission-id-string"
+            ) {
                 await setup.updateDocuments(async (writer) => {
                     const thread = await writer.sessionFamily(AGENT_THREAD_DOC, key, key);
                     const turn = thread.turns?.[0];
@@ -661,12 +1239,29 @@ if (mode === "start" || mode === "recover") {
                         throw new Error("Cannot tamper a missing native agent turn");
                     }
 
-                    turn.submissionId = 0;
+                    if (boundary === "tamper-turn-submission-id-string") {
+                        if (
+                            typeof turn.submissionId !== "number" ||
+                            !Number.isSafeInteger(turn.submissionId)
+                        ) {
+                            throw new Error(
+                                "Cannot stringify a missing native submission reference",
+                            );
+                        }
+
+                        Object.assign(turn, { submissionId: String(turn.submissionId) });
+                    } else {
+                        turn.submissionId = 0;
+                    }
                 });
                 const updated = await setup.snapshot(AGENT_THREAD_DOC, key, context);
+                const boundaryName =
+                    boundary === "tamper-turn-submission-id-string"
+                        ? "turn-submission-id-string"
+                        : "turn-submission-id";
 
                 process.stdout.write(
-                    `SETUP:TAMPERED:turn-submission-id:${updated?.turns?.[0]?.submissionId ?? "missing"}\n`,
+                    `SETUP:TAMPERED:${boundaryName}:${updated?.turns?.[0]?.submissionId ?? "missing"}\n`,
                 );
             }
 
@@ -674,8 +1269,9 @@ if (mode === "start" || mode === "recover") {
                 .map((candidate) => candidate.record)
                 .filter(
                     (candidate) =>
-                        candidate.id !== beforeAttach?.turns?.[0]?.runnerTaskId &&
-                        Number(candidate.conversationId) === Number(beforeAttach?.conversationId),
+                        candidate.id !== persistedRunner?.id &&
+                        agentConversationId !== undefined &&
+                        Number(candidate.conversationId) === Number(agentConversationId),
                 )
                 .map((candidate) => ({
                     id: Number(candidate.id),
@@ -852,6 +1448,56 @@ if (mode === "tamper-native-entry") {
     await harness.close(context);
     process.stdout.write("TAMPERED:native-entry\n");
 } else if (
+    mode === "tamper-result-payload" ||
+    mode === "tamper-result-schema" ||
+    mode === "tamper-result-assistant" ||
+    mode === "tamper-result-submission" ||
+    mode === "tamper-result-task"
+) {
+    const key = workflowAgentThreadKey({
+        runId: "agent-crash-run",
+        threadId: "crash-thread",
+        profileId: profile.id,
+    });
+    const thread = await harness.snapshot(AGENT_THREAD_DOC, key, context);
+
+    if (thread?.turns?.[0]?.candidate === undefined) {
+        throw new Error("Cannot tamper a missing structured-result candidate");
+    }
+
+    await harness.commit(async (tx) => {
+        const current = await tx.doc(AGENT_THREAD_DOC, key, key);
+        const turn = current.turns?.find((candidate) => candidate.turnId === "crash-turn");
+
+        if (turn?.candidate === undefined) {
+            throw new Error("Structured-result candidate disappeared before tampering");
+        }
+
+        if (mode === "tamper-result-payload") {
+            turn.candidate = {
+                ...turn.candidate,
+                payload: { answer: "changed candidate payload", score: 11 },
+            };
+        } else if (mode === "tamper-result-schema") {
+            turn.candidate = { ...turn.candidate, schemaFingerprint: "changed-schema" };
+        } else if (mode === "tamper-result-assistant") {
+            turn.candidate = {
+                ...turn.candidate,
+                assistantEntryId: turn.candidate.assistantEntryId + 1,
+            };
+        } else if (mode === "tamper-result-submission") {
+            turn.candidate = {
+                ...turn.candidate,
+                submissionId: turn.candidate.submissionId + 1,
+            };
+        } else {
+            turn.candidate = { ...turn.candidate, toolTaskId: turn.candidate.toolTaskId + 1 };
+        }
+    }, context);
+
+    await harness.close(context);
+    process.stdout.write(`TAMPERED:${mode}\n`);
+} else if (
     mode === "tamper" ||
     mode === "tamper-content" ||
     mode === "tamper-owner-id" ||
@@ -917,6 +1563,95 @@ if (mode === "tamper-native-entry") {
     await originalStorage.commit([{ type: "task", value }], context);
     await harness.close(context);
     process.stdout.write("TERMINAL:runner\n");
+} else if (mode === "orphan-missing-provider" || mode === "orphan-missing-thread-and-provider") {
+    const key = workflowAgentThreadKey({
+        runId: "agent-crash-run",
+        threadId: "crash-thread",
+        profileId: profile.id,
+    });
+    const thread = await harness.snapshot(AGENT_THREAD_DOC, key, context);
+    const tasks = (await harness.inspect(context)).tasks.map((candidate) => candidate.record);
+    const runnerTaskId = thread?.turns?.[0]?.runnerTaskId;
+    const runner = tasks.find(
+        (candidate) =>
+            candidate.kind === AGENT_RUNNER_TASK_NAME &&
+            Number(candidate.id) === Number(runnerTaskId),
+    );
+    const generation = tasks.find(
+        (candidate) =>
+            candidate.kind === "pi.generation" &&
+            Number(candidate.conversationId) === Number(thread?.conversationId) &&
+            candidate.state.status !== "terminal",
+    );
+
+    if (thread === undefined || runner === undefined || generation === undefined) {
+        throw new Error("Crash fixture has no active agent generation and runner to orphan");
+    }
+
+    await harness.commit(async (tx) => {
+        const provider = await tx.doc(ProviderDoc, thread.conversationId as ConversationId);
+
+        if (provider.sessionId !== thread.providerSessionId) {
+            throw new Error("Crash fixture ProviderDoc does not match its persisted agent thread");
+        }
+
+        if (!Reflect.deleteProperty(provider, "sessionId")) {
+            throw new Error("Crash fixture could not remove the ProviderDoc session mapping");
+        }
+    }, context);
+    const terminalRunner = {
+        ...runner,
+        state: { status: "terminal", outcome: { status: "aborted", reason: "fixture" } },
+    } as typeof runner;
+    const orphanWrites: StorageWrite[] = [{ type: "task", value: terminalRunner }];
+
+    if (mode === "orphan-missing-thread-and-provider") {
+        const documents = await originalStorage.scanDocuments(
+            {
+                scope: { kind: "session" },
+                at: "current",
+                kind: AGENT_THREAD_DOC.definition.kind,
+            },
+            100,
+            undefined,
+            context,
+        );
+        const threadDocument = documents.items.find((document) => document.key === key);
+
+        if (threadDocument === undefined) {
+            throw new Error("Crash fixture cannot retire a missing agent thread record");
+        }
+
+        orphanWrites.push({ type: "document.retire", id: threadDocument.id });
+    }
+
+    await originalStorage.commit(orphanWrites, context);
+    const remainingThreadDocuments = await originalStorage.scanDocuments(
+        {
+            scope: { kind: "session" },
+            at: "current",
+            kind: AGENT_THREAD_DOC.definition.kind,
+        },
+        100,
+        undefined,
+        context,
+    );
+    const threadStillCurrent = remainingThreadDocuments.items.some(
+        (document) => document.key === key,
+    );
+
+    await harness.close(context);
+    process.stdout.write(
+        `ORPHANED:${JSON.stringify({
+            reason:
+                mode === "orphan-missing-thread-and-provider"
+                    ? "thread-and-provider-mapping-missing-runner-terminal"
+                    : "provider-mapping-missing-runner-terminal",
+            conversationId: Number(thread.conversationId),
+            runnerTaskId: Number(runner.id),
+            threadStillCurrent,
+        })}${String.fromCharCode(10)}`,
+    );
 } else if (mode === "abort-owner") {
     const key = workflowAgentThreadKey({
         runId: "agent-crash-run",
@@ -980,7 +1715,8 @@ if (mode === "tamper-native-entry") {
     let recoveredThread = preopen;
     const deadline = Date.now() + 5_000;
     const targetRunnerId = () =>
-        recoveredThread?.turns?.find((turn) => turn.turnId === "crash-turn")?.runnerTaskId;
+        recoveredThread?.turns?.find((turn) => turn.turnId === "crash-turn")?.runnerTaskId ??
+        recoveredRunnerId;
 
     while (targetRunnerId() === undefined && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1044,6 +1780,8 @@ if (mode === "tamper-native-entry") {
             const settled = await harness.getTask(candidate.id as never, context);
 
             return {
+                id: Number(settled?.id ?? candidate.id),
+                conversationId: Number(settled?.conversationId ?? candidate.conversationId),
                 kind: settled?.kind ?? candidate.kind,
                 status: settled?.state.status ?? "missing",
                 outcome: settled?.state.status === "terminal" ? settled.state.outcome.status : null,
@@ -1057,7 +1795,12 @@ if (mode === "tamper-native-entry") {
     );
 
     process.stdout.write(
-        `FINAL:${JSON.stringify({ thread, runner, nativeTasks: settledNativeTasks })}\n`,
+        `FINAL:${JSON.stringify({
+            thread,
+            runner,
+            nativeTasks: settledNativeTasks,
+            nativeAgentResolutionAttempted,
+        })}\n`,
     );
     unsubscribe();
     await hostDispose?.();

@@ -2,7 +2,7 @@
 
 **Plan format:** crywolf-start-work/v1
 
-Status: Target 3 offline implementation is complete and user-approved after independent review (CodeReviewer READY; Oracle ADVISED with no concrete blocker). The implementation was committed as `2c82c53`; the organization-only host/recovery extraction is complete and remains uncommitted for review. No durable workflow receipt or live-provider acceptance is claimed. The latest full repository run passed 341/342 tests; the sole failure is the known browser test at `test/browser.test.ts:659` (`204 !== 200`).
+Status: The original Target 3 offline implementation is complete and user-approved after independent review (CodeReviewer READY; Oracle ADVISED with no concrete blocker). The implementation was committed as `2c82c53`; the organization-only host/recovery extraction is complete and remains uncommitted for review. No durable workflow receipt or live-provider acceptance is claimed. The latest full repository run passed 341/342 tests; the sole failure is the known browser test at `test/browser.test.ts:659` (`204 !== 200`). The owner has now authorized this existing plan to be amended in place with Task T8 for the concrete Target 5 profile-identity/fresh-thread prerequisite; the original READY review does not cover T8.
 Contract: [target-3-agent-adapter-spec.md](target-3-agent-adapter-spec.md), requirements A1–A9,
 evidence E1–E9. The prior confirmed scope and the latest semantic revision are recorded in that contract.
 The full exact scope question/answer and tentative-approval qualification are recorded in that contract.
@@ -25,9 +25,11 @@ not import seams. Root `packages/workflow-runtime/index.ts` exports core and sha
 `src/server/extensions/workflows.ts` registers its native Task before Harness.open; Pocket owns its
 Harness-bound engine. Historical Target 1 artifacts are not current implementation authority.
 
-Do not add Verify, Review policy/verdicts, StartWork, UI or migrations. A fixture profile called reviewer
-proves read-only authority, not Target 5. Delegation stays disabled. No duplicate scheduler, custom
-provider transport, role engine or native core patch. No stored-kind rename/scope/history/fork changes.
+Do not add Verify, Review policy/verdicts, StartWork, UI or migrations. Task T8 adds only the runtime-owned
+profile-resolution and fresh-thread admission primitives needed by Target 5; it does not implement Review.
+A fixture profile called reviewer proves read-only authority, not Target 5. Delegation stays disabled. No
+duplicate scheduler, custom provider transport, role engine or native core patch. No stored-kind
+rename/scope/history/fork changes.
 
 ### Execution discipline
 
@@ -594,7 +596,7 @@ options/startup/close only (no loader changes); exported standalone example/runb
 public-export-only imports and whitespace. Offline Target 3 acceptance requires all applicable native
 scripted/crash tests green, not merely type checking or existing core tests.
 
-### T8 — Explicitly gated live native-provider acceptance
+### Live provider acceptance gate — explicitly gated native-provider acceptance
 
 **Blocked by:** T7; valid provider credentials; explicit network/spend authorization with bounded
 budget and isolated data/workspace. This gate is not a request to obtain credentials now.
@@ -618,13 +620,77 @@ budget and isolated data/workspace. This gate is not a request to obtain credent
 by applicable offline regression. Live acceptance remains GATED until approvals exist and evidence
 is produced; document authoring and scripted tests cannot prove it.
 
+## Task T8 — Resolve the configured read-only reviewer and admit fresh threads atomically
+
+**Depends on:** T4, T5, T6, T7
+
+**Requirements:** A2, A3, A6, A7; Target 5 reviewer-profile and fresh-thread prerequisite.
+
+**Files:**
+
+- Modify: packages/workflow-runtime/agents/profile.ts
+- Modify: packages/workflow-runtime/agents/host.ts
+- Modify: packages/workflow-runtime/agents/runner.ts
+- Modify: packages/workflow-runtime/agents/records.ts
+- Modify: packages/workflow-runtime/agents/recovery.ts
+- Modify: packages/workflow-runtime/core/index.ts
+- Modify: packages/workflow-runtime/index.ts
+- Create: test/workflow-agent-review-profile.test.ts
+- Modify: test/workflow-agent-turn.test.ts
+- Modify: test/workflow-agent-recovery.test.ts
+- Modify: test/workflow-agent-authority.test.ts
+- Modify: test/workflow-agent-host.test.ts
+
+**Acceptance:** The workflow-owned agent context resolves the exact configured, audited read-only reviewer
+through the same runtime that admits its turns, and atomically rejects a pre-used thread when a Review
+gate requires a fresh conversation. This adds no Review verdict policy or second result service.
+
+**Verification:**
+
+- Required: node --test test/workflow-agent-review-profile.test.ts test/workflow-agent-turn.test.ts test/workflow-agent-authority.test.ts
+- Required: node --test test/workflow-agent-recovery.test.ts test/workflow-agent-host.test.ts
+- Required: npm run check
+- Required: npm run lint
+- Required: git diff --check
+
+Detailed acceptance:
+
+1. Add an explicit host-configured read-only Review authority ceiling and reviewer-profile allowlist.
+   Resolve the detached, bounded profile/model/instructions/effective-authority/result descriptor using
+   the same configured profiles, Models, registry, and profile-snapshot path used by `turn`; do not
+   reconstruct identity in Review or expose executable tools, native handles, or private records.
+2. Only an allowlisted profile whose effective extensions, sections, tools, and capabilities stay within
+   that trusted read-only ceiling can resolve for Review. Delegation remains disabled. Return the actual
+   result binding; Target 5 must compare it with its exact Review schema. Include the ceiling and its
+   versions in the identity so config/registry drift changes the binding.
+3. Extend the workflow agent context with runtime-owned Review-profile resolution. A Review turn carries
+   the expected resolved identity and a Review-purpose discriminator; recompute with the same runtime
+   immediately before transactional turn reservation. Identity, registry, authority, or result-schema
+   drift rejects before a conversation or native task is newly admitted.
+4. A `freshThread` admission accepts only an uninitialized thread or an exact replay of that thread's
+   already-reserved first logical turn. Existing history or a different first turn rejects atomically.
+   Bind the expected identity and fresh-thread flag into immutable turn intent and recovery; exact
+   completed-turn replay retains Target 3's existing provider-retry semantics.
+5. Test forged/mismatched identity, a mutation-capable profile constrained by the Review authority
+   ceiling, schema/registry drift between resolution and admission, pre-used threads, exact first-turn
+   replay after reopen, and later same-thread continuation. Exercise actual guarded tool execution and
+   confirm unauthorized mutation/delegation effects remain zero.
+
+**Boundary:** This is a bounded Target 3 runtime capability required by Target 5, not Review policy. Keep
+the host and configured allowlist trusted; do not infer read-only semantics from capability-name text.
+No Pi Durable core patch, stored-kind change, migration, new scheduler, transport, or Pocket-specific path.
+
+**Stop condition:** If the resolver and turn admission cannot be bound to the same public runtime, stop
+with the exact API gap; do not substitute a caller callback, private import, or prompt-only restriction.
+
 ## Dependency / traceability check
 
 ```text
 T1 → T2 → T3 ─┐
-         ├→ T4 ├→ T7 → T8 (credential/network/spend gate)
+         ├→ T4 ├→ T7 → T8 (Review-profile / fresh-thread prerequisite)
          ├→ T5 ┤
          └→ T6 ┘
+                     T7 → separately gated live-provider acceptance
 ```
 
 Only listed edges prevent starting a task. T4/T5/T6 may be independently developed/reviewed after T2;
@@ -632,17 +698,17 @@ T7 must reconcile their overlapping integration edits. No broad refactor is need
 change cannot keep old callers green, expand compatibility, migrate bounded opt-in callers, then
 contract only after all callers move; do not slip a rewrite into an acceptance task.
 
-| Requirement                         | Primary task acceptance                                                                                                  | Installed-gap evidence |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------- |
-| A1 native separate runner/ownership | T2 native one-shot, continuation; T6 cancellation                                                                        | E1,E8                  |
-| A2 explicit enforced narrowing      | T2 closed minimal profile; T4 direct/replay/nested denial                                                                | E6                     |
-| A3 logical identity and fingerprint | T2 atomic/concurrent/conflicting thread/turn; T4 drift                                                                   | E1,E2,E6               |
-| A4 exact durable replay/unknown     | T3 exact saved-answer replay and provider retry semantics; T5 schema promotion                                           | E2,E3,E7               |
-| A5 before-progress recovery         | T1 controlled setup readiness; T3 provider/tool recovery classification; T7 actual Pocket startup                        | E3–E5,E9               |
-| A6 turn/tool runtime authority      | T2 owner/intent admission; T4 static-reopen drift denial at new turn and tool execution (reload optional)                | E4,E6                  |
-| A7 structured exact correlation     | T5 sole direct result and crash/invalid/stale rejection                                                                  | E7                     |
-| A8 selected terminality/cleanup     | T6 selected stop before cleanup, failure retained, no resurrection                                                       | E8                     |
-| A9 hosts/compatibility/live gate    | T1 portable factory/options; T7 static standalone/Pocket/TUI sequence, ownership/Targets1/2; T8 authorized live evidence | E9                     |
+| Requirement                         | Primary task acceptance                                                                                                                                 | Installed-gap evidence |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
+| A1 native separate runner/ownership | T2 native one-shot, continuation; T6 cancellation                                                                                                       | E1,E8                  |
+| A2 explicit enforced narrowing      | T2 closed minimal profile; T4 direct/replay/nested denial                                                                                               | E6                     |
+| A3 logical identity and fingerprint | T2 atomic/concurrent/conflicting thread/turn; T4 drift                                                                                                  | E1,E2,E6               |
+| A4 exact durable replay/unknown     | T3 exact saved-answer replay and provider retry semantics; T5 schema promotion                                                                          | E2,E3,E7               |
+| A5 before-progress recovery         | T1 controlled setup readiness; T3 provider/tool recovery classification; T7 actual Pocket startup                                                       | E3–E5,E9               |
+| A6 turn/tool runtime authority      | T2 owner/intent admission; T4 static-reopen drift denial at new turn and tool execution (reload optional)                                               | E4,E6                  |
+| A7 structured exact correlation     | T5 sole direct result and crash/invalid/stale rejection                                                                                                 | E7                     |
+| A8 selected terminality/cleanup     | T6 selected stop before cleanup, failure retained, no resurrection                                                                                      | E8                     |
+| A9 hosts/compatibility/live gate    | T1 portable factory/options; T7 static standalone/Pocket/TUI sequence and ownership; T8 Review-profile/fresh-thread API; separately gated live evidence | E9                     |
 
 ## Partial-work recovery and blockers
 

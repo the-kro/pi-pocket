@@ -3,12 +3,12 @@ import { copyJson } from "@earendil-works/chord";
 import {
     AgentDoc,
     AssistantEntry,
+    type Agent,
     configure,
     defineTask,
     ProviderDoc,
     UserEntry,
     type ConversationId,
-    type EntryId,
     type RunningTask,
     type SubmissionRecord,
     type TaskId,
@@ -16,9 +16,12 @@ import {
     type TaskRuntime,
     type Tx,
     type UserInput,
+    type Extension,
+    type RegistryReader,
+    type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import type { Models } from "@earendil-works/pi-ai";
-import { canonicalInput } from "../core/identity.ts";
+import { canonicalInput, freezeJson } from "../core/identity.ts";
 import {
     RUN_DOC,
     type WorkflowAgentTurnBinder,
@@ -26,12 +29,20 @@ import {
 } from "../core/index.ts";
 import {
     type AgentThreadIdentity,
-    type WorkflowAgentConfig,
+    type ResolvedWorkflowAgentConfig,
+    type WorkflowAgentCallAuthority,
+    type EffectiveWorkflowAgentAuthority,
     type WorkflowAgentProfile,
+    type WorkflowAgentResultBinding,
+    type WorkflowAgentReviewProfileDescriptor,
+    type WorkflowAgentReviewIdentity,
+    resolveWorkflowAgentAuthority,
     workflowAgentModelFingerprint,
     workflowAgentModelIdentityInputs,
     workflowAgentProfileFingerprint,
     workflowAgentProviderSessionId,
+    workflowAgentResultExtensionName,
+    workflowAgentResultSchemaFingerprint,
     workflowAgentThreadKey,
 } from "./profile.ts";
 import {
@@ -41,12 +52,27 @@ import {
     type AgentThreadRecord,
     type AgentTurnRecord,
 } from "./records.ts";
+import {
+    settleWorkflowAgentTurnInTransaction,
+    workflowAgentTurnResultSchema,
+} from "./structured-result.ts";
+import {
+    workflowAgentSectionSourceName,
+    workflowAgentSectionViewName,
+} from "./section-registry.ts";
 
 export type WorkflowAgentTurnInput = {
     readonly threadId: string;
     readonly turnId: string;
     readonly profile: string;
     readonly content: UserInput;
+    readonly extensions?: readonly string[];
+    readonly sections?: readonly string[];
+    readonly tools?: readonly string[];
+    readonly capabilities?: readonly string[];
+    readonly purpose?: "review";
+    readonly reviewerIdentity?: WorkflowAgentReviewIdentity;
+    readonly freshThread?: boolean;
 };
 
 type AgentRunnerInput = {
@@ -61,22 +87,111 @@ type AgentRunnerInput = {
     readonly intentCanonical: string;
     readonly intentDigest: string;
     readonly content: UserInput;
+    readonly purpose?: "review";
+    readonly reviewerIdentity?: WorkflowAgentReviewIdentity;
+    readonly freshThread?: boolean;
     readonly profileFingerprint: string;
     readonly modelFingerprint: string;
     readonly profileInput: JsonValue;
     readonly modelInput: JsonValue;
+    readonly authorityFingerprint: string;
+    readonly authorityInput: JsonValue;
+    readonly effectiveAuthority: JsonValue;
+    readonly resultSchema?: AgentTurnRecord["resultSchema"];
 };
 type AgentRunnerCheckpoint = { readonly phase: "run" };
 type AgentRunnerRuntime = TaskRuntime<AgentRunnerInput, AgentRunnerCheckpoint, JsonValue, object>;
 type AgentRunnerTask = ReturnType<typeof createWorkflowAgentRunnerTask>;
 
-type ProfileSnapshot = {
+export type WorkflowAgentProfileSnapshot = {
     readonly profile: WorkflowAgentProfile;
     readonly profileFingerprint: string;
     readonly modelFingerprint: string;
+    readonly authorityFingerprint: string;
     readonly profileInput: JsonValue;
     readonly modelInput: JsonValue;
+    readonly authority: EffectiveWorkflowAgentAuthority;
+    readonly authorityInput: JsonValue;
+    readonly extensions: readonly Extension[];
+    readonly tools: readonly ToolRegistration[];
 };
+
+export function workflowAgentSectionViewsMatch(
+    agent: Agent,
+    snapshot: WorkflowAgentProfileSnapshot,
+): boolean {
+    const sectionViews = snapshot.extensions.filter(
+        (extension) => workflowAgentSectionSourceName(extension.name) !== extension.name,
+    );
+
+    if (sectionViews.length === 0) {
+        return true;
+    }
+
+    for (const view of sectionViews) {
+        const selected = agent.extensions.find((extension) => extension.name === view.name);
+
+        if (
+            selected === undefined ||
+            !sameStrings(
+                (selected.sections ?? []).map((section) => section.key),
+                (view.sections ?? []).map((section) => section.key),
+            )
+        ) {
+            return false;
+        }
+    }
+
+    const actualSections = agent.sections
+        .map((section) => section.key)
+        .filter((key) => key !== "instructions");
+
+    return sameStrings(
+        actualSections,
+        snapshot.authority.sections.map((section) => section.key),
+    );
+}
+
+export function workflowAgentNativeSelectionMatches(
+    agent: Agent,
+    snapshot: WorkflowAgentProfileSnapshot,
+): boolean {
+    const expectedExtensions = snapshot.extensions.map((extension) => extension.name);
+    const expectedTools = snapshot.authority.tools.map((entry) => entry.name);
+    const expectedSections = snapshot.authority.sections.map((entry) => entry.key);
+    const selectionNameBySource = new Map(
+        snapshot.authority.extensions.map(
+            (entry, index) => [entry.name, snapshot.extensions[index]!.name] as const,
+        ),
+    );
+    const actualExtensions = agent.extensions.map((extension) => extension.name);
+    const actualTools = agent.tools.map((tool) => tool.name);
+    const actualSections = agent.sections
+        .map((section) => section.key)
+        .filter((key) => key !== "instructions");
+    const actualToolBindings = agent.tools.map((tool) => {
+        const owners = agent.extensions.filter((extension) =>
+            extension.tools?.some((candidate) => candidate.name === tool.name),
+        );
+
+        return owners.length === 1 ? JSON.stringify([owners[0]!.name, tool.name]) : "";
+    });
+    const expectedToolBindings = snapshot.authority.tools.map((entry) =>
+        JSON.stringify([selectionNameBySource.get(entry.extension), entry.name]),
+    );
+
+    return (
+        sameStrings(actualExtensions, expectedExtensions) &&
+        sameStrings(actualTools, expectedTools) &&
+        sameStrings(actualToolBindings, expectedToolBindings) &&
+        new Set(actualTools).size === actualTools.length &&
+        sameStrings(actualSections, expectedSections) &&
+        agent.instructions === snapshot.profile.instructions &&
+        agent.model?.provider === snapshot.profile.model.provider &&
+        agent.model?.modelId === snapshot.profile.model.modelId &&
+        agent.thinkingLevel === (snapshot.profile.thinkingLevel ?? "off")
+    );
+}
 
 type Admission =
     | { readonly status: "completed"; readonly result: JsonValue }
@@ -84,6 +199,36 @@ type Admission =
 
 const PROVIDER_SESSION_PREFIX = "pocket-workflow-agent-v1:";
 const TURN_REQUEST_PREFIX = "pocket-workflow-agent-turn-v1:";
+
+function parseReviewIdentity(value: JsonValue): WorkflowAgentReviewIdentity {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new TypeError("Review turn requires a resolved reviewer identity object");
+    }
+
+    const identity = value as Record<string, JsonValue>;
+    const expectedKeys = [
+        "profileId",
+        "profileFingerprint",
+        "modelFingerprint",
+        "authorityFingerprint",
+        "policyFingerprint",
+        "resultSchemaFingerprint",
+        "fingerprint",
+    ];
+    const stringKeys = expectedKeys.filter((key) => key !== "resultSchemaFingerprint");
+
+    if (
+        Object.keys(identity).length !== expectedKeys.length ||
+        expectedKeys.some((key) => !Object.hasOwn(identity, key)) ||
+        stringKeys.some((key) => typeof identity[key] !== "string" || identity[key].length === 0) ||
+        (identity.resultSchemaFingerprint !== null &&
+            typeof identity.resultSchemaFingerprint !== "string")
+    ) {
+        throw new TypeError("Review turn requires a complete resolved reviewer identity");
+    }
+
+    return copyJson(identity as unknown as JsonValue) as unknown as WorkflowAgentReviewIdentity;
+}
 
 function parseTurnInput(input: JsonValue): WorkflowAgentTurnInput {
     if (typeof input !== "object" || input === null || Array.isArray(input)) {
@@ -101,8 +246,26 @@ function parseTurnInput(input: JsonValue): WorkflowAgentTurnInput {
         record.profile.length === 0 ||
         record.content === undefined ||
         Object.keys(record).some(
-            (key) => !["threadId", "turnId", "profile", "content"].includes(key),
-        )
+            (key) =>
+                ![
+                    "threadId",
+                    "turnId",
+                    "profile",
+                    "content",
+                    "extensions",
+                    "sections",
+                    "tools",
+                    "capabilities",
+                    "purpose",
+                    "reviewerIdentity",
+                    "freshThread",
+                ].includes(key),
+        ) ||
+        (record.purpose !== undefined && record.purpose !== "review") ||
+        (record.purpose === "review" && record.reviewerIdentity === undefined) ||
+        (record.purpose !== "review" && record.reviewerIdentity !== undefined) ||
+        (record.freshThread !== undefined && typeof record.freshThread !== "boolean") ||
+        (record.freshThread !== undefined && record.purpose !== "review")
     ) {
         throw new TypeError(
             "Agent turn requires non-empty threadId, turnId, profile, and content fields",
@@ -114,29 +277,319 @@ function parseTurnInput(input: JsonValue): WorkflowAgentTurnInput {
         turnId: record.turnId,
         profile: record.profile,
         content: copyJson(record.content) as UserInput,
+        ...(record.extensions === undefined
+            ? {}
+            : { extensions: parseNameList(record.extensions, "extensions") }),
+        ...(record.sections === undefined
+            ? {}
+            : { sections: parseNameList(record.sections, "sections") }),
+        ...(record.tools === undefined ? {} : { tools: parseNameList(record.tools, "tools") }),
+        ...(record.capabilities === undefined
+            ? {}
+            : { capabilities: parseNameList(record.capabilities, "capabilities") }),
+        ...(record.purpose === undefined ? {} : { purpose: "review" as const }),
+        ...(record.reviewerIdentity === undefined
+            ? {}
+            : { reviewerIdentity: parseReviewIdentity(record.reviewerIdentity) }),
+        ...(record.freshThread === undefined ? {} : { freshThread: record.freshThread as boolean }),
     };
+}
+
+function parseNameList(value: JsonValue, key: string): readonly string[] {
+    if (
+        !Array.isArray(value) ||
+        value.some((entry) => typeof entry !== "string" || entry.length === 0)
+    ) {
+        throw new TypeError(`Agent turn ${key} must be an array of non-empty names`);
+    }
+
+    return value as string[];
 }
 
 function requestId(threadKey: string, turnId: string): string {
     return `${TURN_REQUEST_PREFIX}${Buffer.from(JSON.stringify([threadKey, turnId]), "utf8").toString("base64url")}`;
 }
 
-function profileSnapshot(models: Models, profile: WorkflowAgentProfile): ProfileSnapshot {
+export function workflowAgentProfileSnapshot(
+    models: Models,
+    config: ResolvedWorkflowAgentConfig,
+    profile: WorkflowAgentProfile,
+    call: WorkflowAgentCallAuthority,
+    registry: RegistryReader,
+): WorkflowAgentProfileSnapshot {
     const profileInput = copyJson(profile as unknown as JsonValue);
     const current = workflowAgentModelFingerprint(models, profile);
+    const authority = resolveWorkflowAgentAuthority(config, profile, call);
+    const snapshot = registry.snapshot();
+    const sourceExtensions = authority.extensions.map((entry) => {
+        const extension = snapshot.extension(entry.name);
+
+        if (extension === undefined) {
+            throw new WorkflowAgentAdmissionError(
+                `Agent extension ${entry.name} is missing from the current registry`,
+            );
+        }
+
+        return extension;
+    });
+    const selectedSectionKeys = new Map<string, Set<string>>();
+
+    for (const section of authority.sections) {
+        const keys = selectedSectionKeys.get(section.extension) ?? new Set<string>();
+
+        keys.add(section.key);
+        selectedSectionKeys.set(section.extension, keys);
+    }
+
+    const registeredSections = sourceExtensions.flatMap((extension) =>
+        (extension.sections ?? [])
+            .filter((section) => selectedSectionKeys.get(extension.name)?.has(section.key))
+            .map((section) => ({ extension: extension.name, key: section.key })),
+    );
+
+    if (
+        registeredSections.length !== authority.sections.length ||
+        registeredSections.some(
+            (section, index) =>
+                authority.sections[index]?.extension !== section.extension ||
+                authority.sections[index]?.key !== section.key,
+        )
+    ) {
+        throw new WorkflowAgentAdmissionError(
+            "Agent effective sections are missing, ambiguous, or out of registry order",
+        );
+    }
+
+    for (const section of authority.sections) {
+        const matches = snapshot
+            .sections()
+            .filter(
+                (candidate) =>
+                    candidate.extension.name === section.extension &&
+                    candidate.section.key === section.key,
+            );
+
+        if (matches.length !== 1) {
+            throw new WorkflowAgentAdmissionError(
+                `Agent section ${section.key} is missing or ambiguous in the current registry`,
+            );
+        }
+    }
+
+    const extensions = authority.extensions.map((entry, index) => {
+        const source = sourceExtensions[index]!;
+        const selectedKeys = (source.sections ?? [])
+            .filter((section) => selectedSectionKeys.get(entry.name)?.has(section.key))
+            .map((section) => section.key);
+        const viewName = workflowAgentSectionViewName(
+            entry.name,
+            entry.version,
+            (source.sections ?? []).map((section) => section.key),
+            selectedKeys,
+        );
+
+        if (viewName === entry.name) {
+            return source;
+        }
+
+        const view = snapshot.extension(viewName);
+
+        if (
+            view === undefined ||
+            view.name !== viewName ||
+            !sameStrings(
+                (view.sections ?? []).map((section) => section.key),
+                selectedKeys,
+            )
+        ) {
+            throw new WorkflowAgentAdmissionError(
+                `Agent section view for extension ${entry.name} is missing or ambiguous`,
+            );
+        }
+
+        return view;
+    });
+    const selectedToolDefinitions = sourceExtensions.flatMap((extension) =>
+        (extension.tools ?? []).map((tool) => ({ extension: extension.name, tool })),
+    );
+    const selectedToolNames = selectedToolDefinitions.map(({ tool }) => tool.name);
+
+    if (new Set(selectedToolNames).size !== selectedToolNames.length) {
+        throw new WorkflowAgentAdmissionError(
+            "Agent selected extensions contain duplicate tool names; authority is ambiguous",
+        );
+    }
+
+    const tools = authority.tools.map((entry) => {
+        const matches = selectedToolDefinitions.filter(({ tool }) => tool.name === entry.name);
+
+        if (matches.length !== 1 || matches[0]!.extension !== entry.extension) {
+            throw new WorkflowAgentAdmissionError(
+                `Agent tool ${entry.name} is missing, duplicated, or unexpectedly replaced`,
+            );
+        }
+
+        return matches[0]!.tool as ToolRegistration;
+    });
+    const authorityInput = copyJson({
+        delegation: false,
+        floor: config.authority ?? {},
+        declaredProfile: {
+            extensions: profile.extensions ?? [],
+            sections: profile.sections ?? [],
+            tools: profile.tools ?? [],
+            capabilities: profile.capabilities ?? [],
+            result: profile.result ?? null,
+        },
+        resultSchema:
+            profile.result === undefined
+                ? null
+                : {
+                      id: profile.result.id,
+                      version: profile.result.version,
+                      toolName: profile.result.toolName,
+                      fingerprint: workflowAgentResultSchemaFingerprint(profile.result),
+                  },
+        effectiveAuthority: {
+            extensions: authority.extensions,
+            sections: authority.sections,
+            tools: authority.tools,
+            capabilities: authority.capabilities,
+        },
+        selectionViews: authority.extensions.map((entry, index) => ({
+            sourceName: entry.name,
+            selectedName: extensions[index]!.name,
+            sections: (extensions[index]!.sections ?? []).map((section) => section.key),
+        })),
+        registry: authority.extensions.map((entry, index) => {
+            const extension = sourceExtensions[index]!;
+
+            return {
+                name: entry.name,
+                version: entry.version,
+                order: index,
+                tools: (extension.tools ?? []).map((tool) => ({
+                    name: tool.name,
+                    schema: JSON.parse(JSON.stringify(tool.parameters)) as JsonValue,
+                    replay: tool.replay ?? "unsafe",
+                })),
+                sections: (extension.sections ?? []).map((section) => section.key),
+                wraps: (extension.wraps ?? []).map((wrap) =>
+                    "tool" in wrap ? { tool: wrap.tool } : { section: wrap.section },
+                ),
+            };
+        }),
+        instructions: profile.instructions,
+        instructionsVersion: profile.instructionsVersion,
+        thinkingLevel: profile.thinkingLevel ?? "off",
+    } as unknown as JsonValue);
 
     return {
         profile,
         profileFingerprint: workflowAgentProfileFingerprint(profile),
+        authorityFingerprint: canonicalInput(authorityInput).digest,
         modelFingerprint: current.fingerprint,
         profileInput,
         modelInput: copyJson(workflowAgentModelIdentityInputs(current.model)),
+        authority,
+        authorityInput,
+        extensions,
+        tools,
     };
 }
 
-function sameJson(left: JsonValue | undefined, right: JsonValue): boolean {
-    if (left === undefined) {
-        return false;
+export type WorkflowAgentReviewProfileResolution = {
+    readonly descriptor: WorkflowAgentReviewProfileDescriptor;
+    readonly snapshot: WorkflowAgentProfileSnapshot;
+};
+
+export function resolveWorkflowAgentReviewProfile(
+    models: Models,
+    config: ResolvedWorkflowAgentConfig,
+    profileId: string,
+    registry: RegistryReader,
+): WorkflowAgentReviewProfileResolution {
+    const review = config.review;
+    const profile = config.byId.get(profileId);
+
+    if (review === undefined) {
+        throw new WorkflowAgentAdmissionError("Review profile resolution is not configured");
+    }
+
+    if (!review.profileAllowlist.includes(profileId) || profile === undefined) {
+        throw new WorkflowAgentAdmissionError(
+            `Agent profile ${profileId} is not on the Review profile allowlist`,
+        );
+    }
+
+    const available = resolveWorkflowAgentAuthority(config, profile);
+    const resultExtension =
+        profile.result === undefined ? undefined : workflowAgentResultExtensionName(profile.result);
+    const call: WorkflowAgentCallAuthority = {
+        extensions: available.extensions
+            .map((entry) => entry.name)
+            .filter(
+                (name) => name !== resultExtension && review.authority.extensions.includes(name),
+            ),
+        sections: available.sections
+            .map((entry) => entry.key)
+            .filter((key) => review.authority.sections.includes(key)),
+        tools: available.tools
+            .map((entry) => entry.name)
+            .filter(
+                (name) =>
+                    name !== profile.result?.toolName && review.authority.tools.includes(name),
+            ),
+        capabilities: available.capabilities.filter((capability) =>
+            review.authority.capabilities.includes(capability),
+        ),
+    };
+    const snapshot = workflowAgentProfileSnapshot(models, config, profile, call, registry);
+    const resultSchemaFingerprint =
+        profile.result === undefined ? null : workflowAgentResultSchemaFingerprint(profile.result);
+    const policyFingerprint = canonicalInput({
+        profileAllowlist: review.profileAllowlist,
+        authority: review.authority as unknown as JsonValue,
+    } as unknown as JsonValue).digest;
+    const identityInput = {
+        profileId,
+        profileFingerprint: snapshot.profileFingerprint,
+        modelFingerprint: snapshot.modelFingerprint,
+        authorityFingerprint: snapshot.authorityFingerprint,
+        policyFingerprint,
+        resultSchemaFingerprint,
+    };
+    const identity = {
+        ...identityInput,
+        fingerprint: canonicalInput(identityInput as unknown as JsonValue).digest,
+    };
+    const descriptor = freezeJson(
+        copyJson({
+            profile: { id: profile.id, version: profile.version },
+            instructions: {
+                text: profile.instructions,
+                version: profile.instructionsVersion,
+            },
+            model: { ...profile.model, fingerprint: snapshot.modelFingerprint },
+            authority: snapshot.authority,
+            ...(profile.result === undefined
+                ? {}
+                : {
+                      result: {
+                          ...profile.result,
+                          fingerprint: resultSchemaFingerprint!,
+                      },
+                  }),
+            identity,
+        } as unknown as JsonValue),
+    ) as unknown as WorkflowAgentReviewProfileDescriptor;
+
+    return { descriptor, snapshot };
+}
+
+function sameJson(left: JsonValue | undefined, right: JsonValue | undefined): boolean {
+    if (left === undefined || right === undefined) {
+        return left === right;
     }
 
     try {
@@ -144,6 +597,10 @@ function sameJson(left: JsonValue | undefined, right: JsonValue): boolean {
     } catch {
         return false;
     }
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+    return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function turnIntent(input: WorkflowAgentTurnInput): {
@@ -156,6 +613,11 @@ function turnIntent(input: WorkflowAgentTurnInput): {
         turnId: input.turnId,
         profile: input.profile,
         content: input.content as unknown as JsonValue,
+        ...(input.purpose === undefined ? {} : { purpose: input.purpose }),
+        ...(input.reviewerIdentity === undefined
+            ? {}
+            : { reviewerIdentity: input.reviewerIdentity as unknown as JsonValue }),
+        ...(input.freshThread === undefined ? {} : { freshThread: input.freshThread }),
     });
 
     return { canonical: frozen.canonical, digest: frozen.digest, value: frozen.input };
@@ -168,6 +630,9 @@ export function workflowAgentRunnerIntentMatches(input: {
     readonly content: JsonValue;
     readonly intentCanonical: string;
     readonly intentDigest: string;
+    readonly purpose?: "review";
+    readonly reviewerIdentity?: WorkflowAgentReviewIdentity;
+    readonly freshThread?: boolean;
 }): boolean {
     try {
         const intent = turnIntent({
@@ -175,6 +640,11 @@ export function workflowAgentRunnerIntentMatches(input: {
             turnId: input.turnId,
             profile: input.profileId,
             content: input.content as unknown as UserInput,
+            ...(input.purpose === undefined ? {} : { purpose: input.purpose }),
+            ...(input.reviewerIdentity === undefined
+                ? {}
+                : { reviewerIdentity: input.reviewerIdentity }),
+            ...(input.freshThread === undefined ? {} : { freshThread: input.freshThread }),
         });
 
         return intent.canonical === input.intentCanonical && intent.digest === input.intentDigest;
@@ -228,7 +698,7 @@ async function validateStoredThread(
     thread: AgentThreadRecord,
     identity: AgentThreadIdentity,
     binding: WorkflowAgentTurnBinding,
-    snapshot: ProfileSnapshot,
+    snapshot: WorkflowAgentProfileSnapshot,
 ): Promise<void> {
     if (!threadIdentityMatches(thread, identity, binding)) {
         throw new WorkflowAgentAdmissionError(
@@ -240,8 +710,10 @@ async function validateStoredThread(
         thread.status !== "ready" ||
         thread.profileFingerprint !== snapshot.profileFingerprint ||
         thread.modelFingerprint !== snapshot.modelFingerprint ||
+        thread.authorityFingerprint !== snapshot.authorityFingerprint ||
         !sameJson(thread.profileInput, snapshot.profileInput) ||
-        !sameJson(thread.modelInput, snapshot.modelInput)
+        !sameJson(thread.modelInput, snapshot.modelInput) ||
+        !sameJson(thread.authorityInput, snapshot.authorityInput)
     ) {
         throw new WorkflowAgentAdmissionError(
             "Agent profile authority or model fingerprint changed",
@@ -283,8 +755,10 @@ async function reserveTurn(
     binding: WorkflowAgentTurnBinding,
     identity: AgentThreadIdentity,
     input: WorkflowAgentTurnInput,
-    snapshot: ProfileSnapshot,
+    snapshot: WorkflowAgentProfileSnapshot,
     runnerTask: AgentRunnerTask,
+    assertReviewIdentityCurrent?: () => void,
+    onConversationAdmitted?: (conversationId: ConversationId) => void,
 ): Promise<Admission> {
     const owner = await tx.task(binding.taskId);
     const run = await tx.doc(RUN_DOC, binding.runId, binding.runId);
@@ -296,6 +770,28 @@ async function reserveTurn(
     const intent = turnIntent(input);
     const thread = await tx.doc(AGENT_THREAD_DOC, key, key);
 
+    assertReviewIdentityCurrent?.();
+
+    if (input.freshThread === true && thread.status !== "uninitialized") {
+        const turns = thread.turns ?? [];
+        const firstTurn = turns[0];
+
+        if (
+            turns.length === 0 ||
+            turns.filter((turn) => turn.turnId === input.turnId).length !== 1 ||
+            firstTurn?.turnId !== input.turnId ||
+            firstTurn.intentCanonical !== intent.canonical ||
+            firstTurn.intentDigest !== intent.digest ||
+            firstTurn.purpose !== "review" ||
+            firstTurn.freshThread !== true ||
+            !sameJson(firstTurn.reviewerIdentity, input.reviewerIdentity as unknown as JsonValue)
+        ) {
+            throw new WorkflowAgentAdmissionError(
+                "Fresh-thread admission requires an uninitialized thread or exact replay of its first turn",
+            );
+        }
+    }
+
     if (thread.status === "uninitialized") {
         const nativeConversation = await tx.createConversation({
             ownership: { kind: "task", taskId: binding.taskId },
@@ -306,9 +802,10 @@ async function reserveTurn(
                 provider: snapshot.profile.model.provider,
                 modelId: snapshot.profile.model.modelId,
             },
-            extensions: [],
-            tools: [],
+            extensions: [...snapshot.extensions],
+            tools: [...snapshot.tools],
             instructions: snapshot.profile.instructions,
+            thinkingLevel: snapshot.profile.thinkingLevel ?? "off",
             cwd: null,
         });
         const provider = await tx.doc(ProviderDoc, nativeConversation.id);
@@ -329,6 +826,8 @@ async function reserveTurn(
         thread.providerSessionId = sessionId;
         thread.profileFingerprint = snapshot.profileFingerprint;
         thread.modelFingerprint = snapshot.modelFingerprint;
+        thread.authorityFingerprint = snapshot.authorityFingerprint;
+        thread.authorityInput = copyJson(snapshot.authorityInput);
         thread.ownerTaskId = Number(binding.taskId);
         thread.profileInput = snapshot.profileInput;
         thread.modelInput = snapshot.modelInput;
@@ -344,6 +843,19 @@ async function reserveTurn(
         }
     } else {
         await validateStoredThread(tx, thread, identity, binding, snapshot);
+        assertReviewIdentityCurrent?.();
+
+        await configure(tx, thread.conversationId as ConversationId, {
+            model: {
+                provider: snapshot.profile.model.provider,
+                modelId: snapshot.profile.model.modelId,
+            },
+            extensions: [...snapshot.extensions],
+            tools: [...snapshot.tools],
+            instructions: snapshot.profile.instructions,
+            thinkingLevel: snapshot.profile.thinkingLevel ?? "off",
+            cwd: null,
+        });
     }
 
     const turns = thread.turns ?? [];
@@ -362,8 +874,18 @@ async function reserveTurn(
         if (
             existingTurn.profileFingerprint !== snapshot.profileFingerprint ||
             existingTurn.modelFingerprint !== snapshot.modelFingerprint ||
+            existingTurn.authorityFingerprint !== snapshot.authorityFingerprint ||
             !sameJson(existingTurn.profileInput, snapshot.profileInput) ||
-            !sameJson(existingTurn.modelInput, snapshot.modelInput)
+            !sameJson(existingTurn.modelInput, snapshot.modelInput) ||
+            !sameJson(existingTurn.authorityInput, snapshot.authorityInput) ||
+            !sameJson(
+                existingTurn.effectiveAuthority,
+                snapshot.authority as unknown as JsonValue,
+            ) ||
+            !sameJson(
+                existingTurn.resultSchema as unknown as JsonValue | undefined,
+                workflowAgentTurnResultSchema(snapshot.profile) as unknown as JsonValue | undefined,
+            )
         ) {
             throw new WorkflowAgentAdmissionError(
                 "Agent turn profile authority or model fingerprint changed",
@@ -392,6 +914,10 @@ async function reserveTurn(
             );
         }
 
+        const conversationId = thread.conversationId as ConversationId;
+
+        onConversationAdmitted?.(conversationId);
+
         return {
             status: "runner",
             taskId: existingTurn.runnerTaskId as TaskId<JsonValue>,
@@ -408,6 +934,7 @@ async function reserveTurn(
         );
     }
 
+    const resultSchema = workflowAgentTurnResultSchema(snapshot.profile);
     const record: AgentTurnRecord = {
         turnId: input.turnId,
         intentCanonical: intent.canonical,
@@ -416,7 +943,16 @@ async function reserveTurn(
         modelFingerprint: snapshot.modelFingerprint,
         profileInput: copyJson(snapshot.profileInput),
         modelInput: copyJson(snapshot.modelInput),
+        authorityFingerprint: snapshot.authorityFingerprint,
+        authorityInput: copyJson(snapshot.authorityInput),
+        effectiveAuthority: copyJson(snapshot.authority as unknown as JsonValue),
+        ...(input.purpose === undefined ? {} : { purpose: input.purpose }),
+        ...(input.reviewerIdentity === undefined
+            ? {}
+            : { reviewerIdentity: copyJson(input.reviewerIdentity as unknown as JsonValue) }),
+        ...(input.freshThread === undefined ? {} : { freshThread: input.freshThread }),
         requestId: requestId(key, input.turnId),
+        ...(resultSchema === undefined ? {} : { resultSchema }),
         status: "reserved",
     };
     const runnerInput: AgentRunnerInput = {
@@ -431,11 +967,33 @@ async function reserveTurn(
         intentCanonical: record.intentCanonical,
         intentDigest: record.intentDigest,
         content: copyJson(input.content as unknown as JsonValue) as UserInput,
+        ...(record.purpose === undefined ? {} : { purpose: record.purpose }),
+        ...(record.reviewerIdentity === undefined
+            ? {}
+            : {
+                  reviewerIdentity: copyJson(
+                      record.reviewerIdentity,
+                  ) as unknown as WorkflowAgentReviewIdentity,
+              }),
+        ...(record.freshThread === undefined ? {} : { freshThread: record.freshThread }),
         profileFingerprint: record.profileFingerprint,
         modelFingerprint: record.modelFingerprint,
         profileInput: copyJson(record.profileInput),
         modelInput: copyJson(record.modelInput),
+        authorityFingerprint: record.authorityFingerprint,
+        authorityInput: copyJson(record.authorityInput),
+        effectiveAuthority: copyJson(record.effectiveAuthority),
+        ...(record.resultSchema === undefined
+            ? {}
+            : {
+                  resultSchema: copyJson(
+                      record.resultSchema as unknown as JsonValue,
+                  ) as AgentRunnerInput["resultSchema"],
+              }),
     };
+
+    assertReviewIdentityCurrent?.();
+
     const runnerTaskId = await tx.createTask(runnerTask, runnerInput, {
         ownership: { kind: "task", taskId: binding.taskId },
         conversationId: binding.conversationId,
@@ -443,93 +1001,170 @@ async function reserveTurn(
 
     record.runnerTaskId = Number(runnerTaskId);
     thread.turns = [...turns, record];
+    const conversationId = thread.conversationId as ConversationId;
+
+    onConversationAdmitted?.(conversationId);
 
     return { status: "runner", taskId: runnerTaskId };
 }
 
 export function createWorkflowAgentTurnBinder(options: {
     readonly models: Models;
-    readonly config: WorkflowAgentConfig;
+    readonly config: ResolvedWorkflowAgentConfig;
+    readonly registry: RegistryReader;
+    readonly resolveReviewProfile?: (profileId: string) => WorkflowAgentReviewProfileResolution;
     readonly runnerTask: AgentRunnerTask;
+    readonly onConversationAdmitted?: (conversationId: ConversationId) => void;
 }): WorkflowAgentTurnBinder {
-    const profiles = new Map(options.config.profiles.map((profile) => [profile.id, profile]));
+    const profiles = options.config.byId;
 
-    return (binding) => async (value) => {
-        if (binding.signal.aborted) {
-            throw binding.signal.reason ?? new WorkflowAgentAdmissionError("Workflow is stopped");
-        }
-
-        const input = parseTurnInput(value);
-        const profile = profiles.get(input.profile);
-
-        if (profile === undefined) {
-            throw new WorkflowAgentAdmissionError(`Agent profile ${input.profile} is unavailable`);
-        }
-
-        const snapshot = profileSnapshot(options.models, profile);
-        const identity: AgentThreadIdentity = {
-            runId: binding.runId,
-            threadId: input.threadId,
-            profileId: profile.id,
-        };
-        const admission = await binding.commit((tx) =>
-            reserveTurn(tx, binding, identity, input, snapshot, options.runnerTask),
-        );
-
-        if (admission.status === "completed") {
-            return admission.result;
-        }
-
-        const receipt = await binding.waitForTask(admission.taskId);
-
-        if (receipt.state.outcome.status !== "completed") {
-            const recovered = await binding.commit(async (tx) => {
-                const threadKey = workflowAgentThreadKey(identity);
-                const thread = await tx.doc(AGENT_THREAD_DOC, threadKey, threadKey);
-                const turn = thread.turns?.find((candidate) => candidate.turnId === input.turnId);
-
-                if (
-                    turn?.status === "completed" &&
-                    turn.runnerTaskId === Number(admission.taskId) &&
-                    turn.result !== undefined
-                ) {
-                    return copyJson(turn.result);
-                }
-
-                return undefined;
-            });
-
-            if (recovered !== undefined) {
-                return recovered;
-            }
-
-            throw new WorkflowAgentAdmissionError(
-                `Native agent runner ended as ${receipt.state.outcome.status}`,
-            );
-        }
-
-        const saved = await binding.commit(async (tx) => {
-            const thread = await tx.doc(
-                AGENT_THREAD_DOC,
-                workflowAgentThreadKey(identity),
-                workflowAgentThreadKey(identity),
-            );
-            const turn = thread.turns?.find((candidate) => candidate.turnId === input.turnId);
-
-            if (
-                turn?.status !== "completed" ||
-                turn.runnerTaskId !== Number(admission.taskId) ||
-                turn.result === undefined
-            ) {
-                throw new WorkflowAgentAdmissionError(
-                    "Native runner completed without its exact durable agent result",
+    return (binding) => {
+        const handler = async (value: JsonValue) => {
+            if (binding.signal.aborted) {
+                throw (
+                    binding.signal.reason ?? new WorkflowAgentAdmissionError("Workflow is stopped")
                 );
             }
 
-            return copyJson(turn.result);
-        });
+            const input = parseTurnInput(value);
+            const profile = profiles.get(input.profile);
 
-        return saved;
+            if (profile === undefined) {
+                throw new WorkflowAgentAdmissionError(
+                    `Agent profile ${input.profile} is unavailable`,
+                );
+            }
+
+            const snapshot =
+                input.purpose === "review"
+                    ? undefined
+                    : workflowAgentProfileSnapshot(
+                          options.models,
+                          options.config,
+                          profile,
+                          input,
+                          options.registry,
+                      );
+            const identity: AgentThreadIdentity = {
+                runId: binding.runId,
+                threadId: input.threadId,
+                profileId: profile.id,
+            };
+
+            const requireCurrentReviewIdentity = () => {
+                const resolved = options.resolveReviewProfile?.(profile.id);
+
+                if (
+                    resolved === undefined ||
+                    !sameJson(
+                        resolved.descriptor.identity as unknown as JsonValue,
+                        input.reviewerIdentity as unknown as JsonValue,
+                    )
+                ) {
+                    throw new WorkflowAgentAdmissionError(
+                        "Resolved Review identity changed before turn reservation",
+                    );
+                }
+
+                return resolved;
+            };
+
+            const assertReviewIdentityCurrent =
+                input.purpose === "review" ? () => void requireCurrentReviewIdentity() : undefined;
+            const admission = await binding.commit((tx) => {
+                let currentSnapshot = snapshot;
+
+                if (input.purpose === "review") {
+                    currentSnapshot = requireCurrentReviewIdentity().snapshot;
+                }
+
+                if (currentSnapshot === undefined) {
+                    throw new WorkflowAgentAdmissionError("Agent profile snapshot is unavailable");
+                }
+
+                return reserveTurn(
+                    tx,
+                    binding,
+                    identity,
+                    input,
+                    currentSnapshot,
+                    options.runnerTask,
+                    assertReviewIdentityCurrent,
+                    options.onConversationAdmitted,
+                );
+            });
+
+            if (admission.status === "completed") {
+                return admission.result;
+            }
+
+            const receipt = await binding.waitForTask(admission.taskId);
+
+            if (receipt.state.outcome.status !== "completed") {
+                const recovered = await binding.commit(async (tx) => {
+                    const threadKey = workflowAgentThreadKey(identity);
+                    const thread = await tx.doc(AGENT_THREAD_DOC, threadKey, threadKey);
+                    const turn = thread.turns?.find(
+                        (candidate) => candidate.turnId === input.turnId,
+                    );
+
+                    if (
+                        turn?.status === "completed" &&
+                        turn.runnerTaskId === Number(admission.taskId) &&
+                        turn.result !== undefined
+                    ) {
+                        return copyJson(turn.result);
+                    }
+
+                    return undefined;
+                });
+
+                if (recovered !== undefined) {
+                    return recovered;
+                }
+
+                throw new WorkflowAgentAdmissionError(
+                    `Native agent runner ended as ${receipt.state.outcome.status}`,
+                );
+            }
+
+            const saved = await binding.commit(async (tx) => {
+                const thread = await tx.doc(
+                    AGENT_THREAD_DOC,
+                    workflowAgentThreadKey(identity),
+                    workflowAgentThreadKey(identity),
+                );
+                const turn = thread.turns?.find((candidate) => candidate.turnId === input.turnId);
+
+                if (
+                    turn?.status !== "completed" ||
+                    turn.runnerTaskId !== Number(admission.taskId) ||
+                    turn.result === undefined
+                ) {
+                    throw new WorkflowAgentAdmissionError(
+                        "Native runner completed without its exact durable agent result",
+                    );
+                }
+
+                return copyJson(turn.result);
+            });
+
+            return saved;
+        };
+
+        return Object.assign(handler, {
+            resolveReviewProfile: (profileId: string) => {
+                const resolved = options.resolveReviewProfile?.(profileId);
+
+                if (resolved === undefined) {
+                    throw new WorkflowAgentAdmissionError(
+                        "Review profile resolution is not configured",
+                    );
+                }
+
+                return resolved.descriptor;
+            },
+        });
     };
 }
 
@@ -560,6 +1195,8 @@ function validateRunnerThread(
         thread.profileId !== input.profileId ||
         thread.conversationId !== input.conversationId ||
         thread.ownerTaskId !== input.workflowTaskId ||
+        thread.authorityFingerprint !== input.authorityFingerprint ||
+        !sameJson(thread.authorityInput, input.authorityInput) ||
         thread.providerSessionId !==
             workflowAgentProviderSessionId({
                 runId: input.runId,
@@ -572,6 +1209,19 @@ function validateRunnerThread(
                 turn.runnerTaskId === Number(ownerTaskId) &&
                 turn.intentCanonical === input.intentCanonical &&
                 turn.intentDigest === input.intentDigest &&
+                turn.authorityFingerprint === input.authorityFingerprint &&
+                turn.purpose === input.purpose &&
+                turn.freshThread === input.freshThread &&
+                sameJson(
+                    turn.reviewerIdentity,
+                    input.reviewerIdentity as unknown as JsonValue | undefined,
+                ) &&
+                sameJson(turn.authorityInput, input.authorityInput) &&
+                sameJson(turn.effectiveAuthority, input.effectiveAuthority) &&
+                sameJson(
+                    turn.resultSchema as unknown as JsonValue | undefined,
+                    input.resultSchema as unknown as JsonValue | undefined,
+                ) &&
                 turn.requestId === input.requestId,
         ) !== true
     ) {
@@ -702,32 +1352,40 @@ async function completeRunner(
     context: Context,
     input: AgentRunnerInput,
     runnerTaskId: TaskId<JsonValue>,
-    submission: SubmissionRecord,
-    answerEntryId: EntryId,
-    answer: JsonValue,
+    binding?: WorkflowAgentResultBinding,
 ): Promise<void> {
-    await runtime.commit(async (tx) => {
-        const thread = await tx.doc(AGENT_THREAD_DOC, input.threadKey, input.threadKey);
-        const turn = findTurn(thread, input.turnId, runnerTaskId);
+    let settlement: Awaited<ReturnType<typeof settleWorkflowAgentTurnInTransaction>> | undefined;
 
-        if (
-            turn.requestId !== input.requestId ||
-            turn.intentCanonical !== input.intentCanonical ||
-            turn.submissionId !== Number(submission.id) ||
-            submission.status !== "done" ||
-            submission.answer !== answerEntryId
-        ) {
-            throw new WorkflowAgentAdmissionError(
-                "Native answer cannot be correlated to the exact admitted agent turn",
-            );
+    await runtime.commit(async (tx, current) => {
+        settlement = await settleWorkflowAgentTurnInTransaction(tx, {
+            threadKey: input.threadKey,
+            runId: input.runId,
+            threadId: input.threadId,
+            profileId: input.profileId,
+            turnId: input.turnId,
+            runnerTaskId: Number(runnerTaskId),
+            requestId: input.requestId,
+            profileFingerprint: input.profileFingerprint,
+            ...(binding === undefined ? {} : { binding }),
+        });
+
+        if (settlement.status !== "completed") {
+            return { status: "running", checkpoint: current.state.checkpoint };
         }
 
-        turn.status = "completed";
-        turn.answerEntryId = Number(answerEntryId);
-        turn.result = copyJson(answer);
-
-        return { status: "terminal", outcome: { status: "completed", result: copyJson(answer) } };
+        return {
+            status: "terminal",
+            outcome: { status: "completed", result: copyJson(settlement.result) },
+        };
     }, context);
+
+    if (settlement?.status !== "completed") {
+        throw new WorkflowAgentAdmissionError(
+            settlement?.status === "conflict"
+                ? settlement.reason
+                : "Native agent submission is not settled with its exact result",
+        );
+    }
 }
 
 async function runAgentTurn(
@@ -735,7 +1393,8 @@ async function runAgentTurn(
     runtime: AgentRunnerRuntime,
     context: Context,
     models: Models,
-    profiles: ReadonlyMap<string, WorkflowAgentProfile>,
+    config: ResolvedWorkflowAgentConfig,
+    registry: RegistryReader,
 ): Promise<void> {
     const input = task.input;
 
@@ -747,6 +1406,11 @@ async function runAgentTurn(
             content: input.content as unknown as JsonValue,
             intentCanonical: input.intentCanonical,
             intentDigest: input.intentDigest,
+            ...(input.purpose === undefined ? {} : { purpose: input.purpose }),
+            ...(input.reviewerIdentity === undefined
+                ? {}
+                : { reviewerIdentity: input.reviewerIdentity }),
+            ...(input.freshThread === undefined ? {} : { freshThread: input.freshThread }),
         })
     ) {
         throw new WorkflowAgentAdmissionError(
@@ -754,19 +1418,50 @@ async function runAgentTurn(
         );
     }
 
-    const currentProfile = profiles.get(input.profileId);
+    const currentProfile = config.byId.get(input.profileId);
 
     if (currentProfile === undefined) {
         throw new WorkflowAgentAdmissionError(`Agent profile ${input.profileId} is unavailable`);
     }
 
-    const snapshot = profileSnapshot(models, currentProfile);
+    const effective = input.effectiveAuthority as unknown as EffectiveWorkflowAgentAuthority;
+    const snapshot = workflowAgentProfileSnapshot(
+        models,
+        config,
+        currentProfile,
+        {
+            extensions: effective.extensions.map((entry) => entry.name),
+            sections: effective.sections.map((entry) => entry.key),
+            tools: effective.tools.map((entry) => entry.name),
+            capabilities: effective.capabilities,
+        },
+        registry,
+    );
+    let reviewIdentityIsCurrent =
+        input.purpose === undefined &&
+        input.reviewerIdentity === undefined &&
+        input.freshThread === undefined;
+
+    if (input.purpose === "review") {
+        const review = resolveWorkflowAgentReviewProfile(models, config, input.profileId, registry);
+
+        reviewIdentityIsCurrent =
+            sameJson(
+                review.descriptor.identity as unknown as JsonValue,
+                input.reviewerIdentity as unknown as JsonValue,
+            ) &&
+            sameJson(review.snapshot.authority as unknown as JsonValue, input.effectiveAuthority);
+    }
 
     if (
+        !reviewIdentityIsCurrent ||
         snapshot.profileFingerprint !== input.profileFingerprint ||
         snapshot.modelFingerprint !== input.modelFingerprint ||
+        snapshot.authorityFingerprint !== input.authorityFingerprint ||
         !sameJson(snapshot.profileInput, input.profileInput) ||
-        !sameJson(snapshot.modelInput, input.modelInput)
+        !sameJson(snapshot.modelInput, input.modelInput) ||
+        !sameJson(snapshot.authorityInput, input.authorityInput) ||
+        !sameJson(snapshot.authority as unknown as JsonValue, input.effectiveAuthority)
     ) {
         throw new WorkflowAgentAdmissionError(
             "Agent profile authority or model fingerprint drifted before dispatch",
@@ -800,8 +1495,10 @@ async function runAgentTurn(
     if (
         nativeThread.profileFingerprint !== snapshot.profileFingerprint ||
         nativeThread.modelFingerprint !== snapshot.modelFingerprint ||
+        nativeThread.authorityFingerprint !== snapshot.authorityFingerprint ||
         !sameJson(nativeThread.profileInput, snapshot.profileInput) ||
-        !sameJson(nativeThread.modelInput, snapshot.modelInput)
+        !sameJson(nativeThread.modelInput, snapshot.modelInput) ||
+        !sameJson(nativeThread.authorityInput, snapshot.authorityInput)
     ) {
         throw new WorkflowAgentAdmissionError(
             "Agent thread authority fingerprint drifted before native dispatch",
@@ -831,17 +1528,39 @@ async function runAgentTurn(
 
     const existing = await lookupSubmission(runtime, context, input);
 
+    if (existing.record === undefined) {
+        const nativeAgent = await runtime.snapshot(
+            AgentDoc,
+            input.conversationId as ConversationId,
+            context,
+        );
+
+        if (
+            nativeAgent === undefined ||
+            !Array.isArray(nativeAgent.extensions) ||
+            !sameStrings(
+                nativeAgent.extensions,
+                snapshot.extensions.map((extension) => extension.name),
+            ) ||
+            !Array.isArray(nativeAgent.tools) ||
+            !sameStrings(
+                nativeAgent.tools,
+                snapshot.tools.map((tool) => tool.name),
+            ) ||
+            nativeAgent.instructions !== snapshot.profile.instructions ||
+            nativeAgent.model?.provider !== snapshot.profile.model.provider ||
+            nativeAgent.model?.modelId !== snapshot.profile.model.modelId ||
+            nativeAgent.thinkingLevel !== (snapshot.profile.thinkingLevel ?? "off")
+        ) {
+            throw new WorkflowAgentAdmissionError(
+                "Native agent extension, tool, section, or model selection drifted before dispatch",
+            );
+        }
+    }
+
     if (existing.record?.status === "done") {
         await setSubmissionMapping(runtime, context, input, task.id, existing.record);
-        await completeRunner(
-            runtime,
-            context,
-            input,
-            task.id,
-            existing.record,
-            existing.record.answer!,
-            existing.answer!,
-        );
+        await completeRunner(runtime, context, input, task.id, currentProfile.result);
 
         return;
     }
@@ -927,15 +1646,7 @@ async function runAgentTurn(
         );
     }
 
-    await completeRunner(
-        runtime,
-        context,
-        input,
-        task.id,
-        settled,
-        settled.answer,
-        copyJson(answer as unknown as JsonValue),
-    );
+    await completeRunner(runtime, context, input, task.id, currentProfile.result);
 }
 
 async function classifyRunnerFailure(
@@ -943,20 +1654,8 @@ async function classifyRunnerFailure(
     input: AgentRunnerInput,
     runnerTaskId: TaskId<JsonValue>,
     context: Context,
+    config: ResolvedWorkflowAgentConfig,
 ): Promise<void> {
-    let exactCompleted:
-        { readonly submission: SubmissionRecord; readonly answer: JsonValue } | undefined;
-
-    try {
-        const located = await lookupSubmission(runtime, context, input);
-
-        if (located.record?.status === "done" && located.answer !== undefined) {
-            exactCompleted = { submission: located.record, answer: located.answer };
-        }
-    } catch {
-        // A failed or mismatched lookup cannot prove a safe result; the transaction below fences it.
-    }
-
     await runtime.commit(async (tx, current) => {
         const submission = await tx.submissionByRequest(
             input.conversationId as ConversationId,
@@ -968,45 +1667,24 @@ async function classifyRunnerFailure(
                 candidate.turnId === input.turnId &&
                 candidate.runnerTaskId === Number(runnerTaskId),
         );
-        const exactThreadIdentity =
-            thread.schemaVersion === 1 &&
-            thread.status === "ready" &&
-            thread.runId === input.runId &&
-            thread.threadId === input.threadId &&
-            thread.profileId === input.profileId &&
-            thread.conversationId === input.conversationId &&
-            thread.ownerTaskId === input.workflowTaskId &&
-            thread.providerSessionId ===
-                workflowAgentProviderSessionId({
-                    runId: input.runId,
-                    threadId: input.threadId,
-                    profileId: input.profileId,
-                });
 
-        if (
-            exactCompleted !== undefined &&
-            turn !== undefined &&
-            (turn.status === "reserved" || turn.status === "submitted") &&
-            exactThreadIdentity &&
-            submission?.type === "input" &&
-            submission.status === "done" &&
-            Number(submission.id) === Number(exactCompleted.submission.id) &&
-            Number(submission.answer) === Number(exactCompleted.submission.answer) &&
-            submission.conversationId === input.conversationId &&
-            submission.requestId === input.requestId &&
-            turn.requestId === input.requestId &&
-            turn.intentCanonical === input.intentCanonical &&
-            turn.intentDigest === input.intentDigest &&
-            turn.profileFingerprint === input.profileFingerprint &&
-            turn.modelFingerprint === input.modelFingerprint &&
-            sameJson(turn.profileInput, input.profileInput) &&
-            sameJson(turn.modelInput, input.modelInput) &&
-            (turn.submissionId === undefined || turn.submissionId === Number(submission.id))
-        ) {
-            turn.status = "completed";
-            turn.submissionId = Number(submission.id);
-            turn.answerEntryId = Number(submission.answer);
-            turn.result = copyJson(exactCompleted.answer);
+        if (submission?.status === "done") {
+            const binding = config.byId.get(input.profileId)?.result;
+            const settlement = await settleWorkflowAgentTurnInTransaction(tx, {
+                threadKey: input.threadKey,
+                runId: input.runId,
+                threadId: input.threadId,
+                profileId: input.profileId,
+                turnId: input.turnId,
+                runnerTaskId: Number(runnerTaskId),
+                requestId: input.requestId,
+                profileFingerprint: input.profileFingerprint,
+                ...(binding === undefined ? {} : { binding }),
+            });
+
+            if (settlement.status === "conflict") {
+                thread.nativeRunnerTaskId = Number(runnerTaskId);
+            }
 
             return { status: "running", checkpoint: current.state.checkpoint };
         }
@@ -1035,9 +1713,11 @@ async function classifyRunnerFailure(
     }, context);
 }
 
-export function createWorkflowAgentRunnerTask(models: Models, config: WorkflowAgentConfig) {
-    const profiles = new Map(config.profiles.map((profile) => [profile.id, profile]));
-
+export function createWorkflowAgentRunnerTask(
+    models: Models,
+    config: ResolvedWorkflowAgentConfig,
+    registry: RegistryReader,
+) {
     return defineTask<AgentRunnerInput, AgentRunnerCheckpoint, JsonValue>({
         name: AGENT_RUNNER_TASK_NAME,
         version: 1,
@@ -1045,10 +1725,10 @@ export function createWorkflowAgentRunnerTask(models: Models, config: WorkflowAg
         phases: {
             run: async (task, runtime, context) => {
                 try {
-                    await runAgentTurn(task, runtime, context, models, profiles);
+                    await runAgentTurn(task, runtime, context, models, config, registry);
                 } catch (error) {
                     try {
-                        await classifyRunnerFailure(runtime, task.input, task.id, context);
+                        await classifyRunnerFailure(runtime, task.input, task.id, context, config);
                     } catch (classificationError) {
                         throw new AggregateError(
                             [error, classificationError],

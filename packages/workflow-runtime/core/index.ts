@@ -19,6 +19,7 @@ import {
 import { canonicalInput, freezeJson, idempotencyKey } from "./identity.ts";
 import { observeStopCall, RunControl, StopFailures } from "./run-control.ts";
 import { WorkflowTimerHost, type WorkflowTimerOptions } from "../timer-host.ts";
+import type { WorkflowAgentReviewProfileDescriptor } from "../agents/profile.ts";
 
 export type WorkflowErrorRecord = {
     readonly name: string;
@@ -67,11 +68,17 @@ export type WorkflowAgentTurnBinding = {
     commit<T>(change: (tx: Tx) => T | Promise<T>): Promise<T>;
     waitForTask<T>(id: TaskId<T>): Promise<SettledTask<T>>;
 };
-export type WorkflowAgentTurnHandler = (input: JsonValue) => JsonValue | Promise<JsonValue>;
+export type WorkflowAgentReviewProfileResolver = (
+    profileId: string,
+) => WorkflowAgentReviewProfileDescriptor | Promise<WorkflowAgentReviewProfileDescriptor>;
+export type WorkflowAgentTurnHandler = ((input: JsonValue) => JsonValue | Promise<JsonValue>) & {
+    readonly resolveReviewProfile?: WorkflowAgentReviewProfileResolver;
+};
 export type WorkflowAgentTurnBinder = (
     binding: WorkflowAgentTurnBinding,
 ) => WorkflowAgentTurnHandler;
 export type WorkflowAgentContext = {
+    resolveReviewProfile(profileId: string): Promise<WorkflowAgentReviewProfileDescriptor>;
     turn(input: JsonValue): Promise<JsonValue>;
 };
 export type WorkflowContext<I extends JsonValue> = {
@@ -1721,6 +1728,28 @@ function createWorkflowTask(
                         agentTurn === undefined
                             ? undefined
                             : {
+                                  resolveReviewProfile: (profileId: string) => {
+                                      if (typeof profileId !== "string" || profileId.length === 0) {
+                                          return Promise.reject(
+                                              new TypeError("Review profile ID must be non-empty"),
+                                          );
+                                      }
+
+                                      const resolve = agentTurn.resolveReviewProfile;
+
+                                      if (resolve === undefined) {
+                                          return Promise.reject(
+                                              new Error("Review profile resolution is unavailable"),
+                                          );
+                                      }
+
+                                      return effects!.track(
+                                          async () =>
+                                              freezeJson(
+                                                  copyJson(await resolve(profileId)),
+                                              ) as unknown as WorkflowAgentReviewProfileDescriptor,
+                                      );
+                                  },
                                   turn: (input: JsonValue) =>
                                       effects!.track(async () =>
                                           copyJson(await agentTurn(freezeJson(input))),

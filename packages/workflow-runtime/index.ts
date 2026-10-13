@@ -18,6 +18,9 @@ export * from "./verification/workspace.ts";
 export * from "./verification/command.ts";
 export * from "./verification/result.ts";
 export * from "./verification/verify.ts";
+export * from "./review/types.ts";
+export * from "./review/contract.ts";
+export * from "./review/review.ts";
 
 /** Shared host-independent kernel for adapters that register its Task and own its Harness lifecycle. */
 export const workflowRuntimeKernel = createWorkflowRuntimeKernel();

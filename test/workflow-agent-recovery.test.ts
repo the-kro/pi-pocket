@@ -6,11 +6,157 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import { canRecoverDefinitelyNotSubmittedTurn } from "../packages/workflow-runtime/agents/recovery.ts";
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const crashWorker = join(projectRoot, "test/fixtures/workflow-agent-crash-worker.ts");
+const reviewCrashWorkerSource = String.raw`
+import { closeSync, fsyncSync, openSync, writeSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { createRegistry } from "@earendil-works/pi-durable";
+import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+
+const root = process.cwd();
+const mode = process.env.PI_REVIEW_MODE;
+const database = process.env.PI_REVIEW_DB;
+const markers = process.env.PI_REVIEW_MARKERS;
+const context = BACKGROUND_CONTEXT;
+const runId = "review-recovery-run";
+const threadId = "review-recovery-thread";
+const profileId = "review-recovery-profile";
+
+function markDispatch() {
+    const descriptor = openSync(markers, "a");
+
+    try {
+        writeSync(descriptor, "provider-dispatch\n");
+        fsyncSync(descriptor);
+    } finally {
+        closeSync(descriptor);
+    }
+
+    writeSync(1, "REVIEW-DISPATCHED\n");
+}
+
+const { AGENT_THREAD_DOC, createWorkflowAgentRuntime, workflowAgentThreadKey } = await import(
+    pathToFileURL(join(root, "packages/workflow-runtime/index.ts")).href
+);
+const { defineWorkflow } = await import(
+    pathToFileURL(join(root, "packages/workflow-runtime/core/index.ts")).href
+);
+const faux = fauxProvider();
+const models = createModels();
+const baseProvider = faux.provider;
+const api = "faux-review-recovery-v1";
+const provider = {
+    ...baseProvider,
+    api,
+    getModels: (...args) => baseProvider.getModels(...args).map((model) => ({ ...model, api })),
+    streamSimple: (...args) => {
+        markDispatch();
+
+        if (mode === "start") {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+        }
+
+        return baseProvider.streamSimple(...args);
+    },
+};
+
+models.setProvider(provider);
+faux.setResponses([fauxAssistantMessage("recovered Review result")]);
+const model = models.getModel("faux", "faux-1");
+const profile = {
+    id: profileId,
+    version: 1,
+    instructions: "Review the persisted evidence.",
+    instructionsVersion: "review-recovery-v1",
+    model: { provider: "faux", modelId: "faux-1", api: model.api, providerVersion: "review-v1" },
+};
+const registry = createRegistry();
+const runtime = createWorkflowAgentRuntime({
+    harnessOptions: { models, registry },
+    agentConfig: {
+        profiles: [profile],
+        review: {
+            profileAllowlist: [profileId],
+            authority: { extensions: [], sections: [], tools: [], capabilities: [] },
+        },
+    },
+});
+registry.install(runtime.extension);
+const workflow = defineWorkflow({
+    id: "review-recovery-workflow",
+    version: 1,
+    async run({ agent }) {
+        const resolved = await agent.resolveReviewProfile(profileId);
+
+        return agent.turn({
+            threadId,
+            turnId: "review-first-turn",
+            profile: profileId,
+            content: "Review the evidence.",
+            purpose: "review",
+            reviewerIdentity: resolved.identity,
+            freshThread: true,
+        });
+    },
+});
+runtime.register(workflow);
+const storage = await openNodeSqliteStorage(database);
+const host = await runtime.openHost(storage, context, () => undefined);
+
+if (mode === "start") {
+    await runtime.engine.start(workflow, null, { runId }, context);
+    await new Promise(() => {});
+} else {
+    const result = await runtime.engine.wait(runId, context);
+    const thread = await host.harness.snapshot(
+        AGENT_THREAD_DOC,
+        workflowAgentThreadKey({ runId, threadId, profileId }),
+        context,
+    );
+
+    writeSync(1, "FINAL:" + JSON.stringify({ result, thread }) + String.fromCharCode(10));
+    await host.dispose();
+    await runtime.close();
+    await host.harness.close(context);
+}
+`;
 
 type Worker = { readonly child: ChildProcess; output: string; errors: string };
+
+function startReviewWorker(mode: "start" | "recover", database: string, markers: string): Worker {
+    const child = spawn(
+        process.execPath,
+        ["--experimental-strip-types", "--input-type=module", "-e", reviewCrashWorkerSource],
+        {
+            cwd: projectRoot,
+            env: {
+                ...process.env,
+                PI_REVIEW_MODE: mode,
+                PI_REVIEW_DB: database,
+                PI_REVIEW_MARKERS: markers,
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+        },
+    );
+    const worker: Worker = { child, output: "", errors: "" };
+
+    child.stdout!.setEncoding("utf8");
+    child.stderr!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
+        worker.output += chunk;
+    });
+    child.stderr!.on("data", (chunk: string) => {
+        worker.errors += chunk;
+    });
+
+    return worker;
+}
 
 function startWorker(
     mode:
@@ -22,7 +168,9 @@ function startWorker(
         | "tamper-owner-id"
         | "tamper-workflow-task-id"
         | "abort-owner"
-        | "terminal-runner",
+        | "terminal-runner"
+        | "orphan-missing-provider"
+        | "orphan-missing-thread-and-provider",
     database: string,
     markers: string,
     boundary = "none",
@@ -127,6 +275,73 @@ async function dispatchMarkers(path: string): Promise<string[]> {
         throw error;
     }
 }
+
+test("only reserved turns are eligible for recovery without a native submission", () => {
+    const common = {
+        activeWorkflowOwner: true,
+        exactTurn: true,
+        submission: undefined,
+    };
+
+    assert.equal(canRecoverDefinitelyNotSubmittedTurn({ ...common, turnStatus: "reserved" }), true);
+    assert.equal(
+        canRecoverDefinitelyNotSubmittedTurn({ ...common, turnStatus: "not-completed" }),
+        false,
+    );
+});
+
+test("reopen replays an exact fresh Review first turn with its persisted identity", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-pocket-agent-review-recovery-"));
+    const database = join(directory, "agent.sqlite");
+    const markers = join(directory, "provider-dispatches.log");
+    const first = startReviewWorker("start", database, markers);
+    let recovery: Worker | undefined;
+
+    try {
+        await outputUntil(first, "REVIEW-DISPATCHED");
+        await killWorker(first);
+        assert.deepEqual(await dispatchMarkers(markers), ["provider-dispatch"]);
+
+        recovery = startReviewWorker("recover", database, markers);
+        const output = await outputUntil(recovery, "FINAL:");
+
+        await successfulExit(recovery);
+
+        const final = payloadAfter(output, "FINAL:") as {
+            readonly result: { readonly content: { readonly text: string }[] };
+            readonly thread: {
+                readonly status: string;
+                readonly turns: readonly {
+                    readonly status: string;
+                    readonly purpose?: string;
+                    readonly freshThread?: boolean;
+                    readonly reviewerIdentity?: { readonly fingerprint?: string };
+                }[];
+            };
+        };
+        const firstTurn = final.thread.turns[0];
+
+        assert.equal(final.thread.status, "ready");
+        assert.equal(final.thread.turns.length, 1);
+        assert.equal(firstTurn?.status, "completed");
+        assert.equal(firstTurn?.purpose, "review");
+        assert.equal(firstTurn?.freshThread, true);
+        assert.equal(typeof firstTurn?.reviewerIdentity?.fingerprint, "string");
+        assert.equal(final.result.content[0]?.text, "recovered Review result");
+        assert.deepEqual(await dispatchMarkers(markers), [
+            "provider-dispatch",
+            "provider-dispatch",
+        ]);
+    } finally {
+        await killWorker(first);
+
+        if (recovery !== undefined && recovery.child.exitCode === null) {
+            await killWorker(recovery);
+        }
+
+        await rm(directory, { recursive: true, force: true });
+    }
+});
 
 test("reopen replays workflow intent when killed before atomic agent intent commit", async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-pocket-agent-no-intent-crash-"));
@@ -342,11 +557,14 @@ test("reopen fences task content that no longer matches the durable agent intent
 
         await successfulExit(recovery);
 
-        const preopen = payloadAfter(output, "PREOPEN:");
+        const preopen = payloadAfter(output, "PREOPEN:") as {
+            status: string;
+            turns: { turnId: string; status: string }[];
+        };
         const final = payloadAfter(output, "FINAL:");
         const thread = final.thread as {
             status: string;
-            turns: { status: string }[];
+            turns: { turnId: string; status: string }[];
         };
         const runner = final.runner as { state: { status: string; outcome?: { status: string } } };
 
@@ -453,6 +671,465 @@ test("reopen fences a persisted submission reference that points elsewhere", asy
         assert.equal(runner.state.status, "terminal");
         assert.equal(runner.state.outcome?.status, "aborted");
         assert.deepEqual(await dispatchMarkers(markers), []);
+    } finally {
+        await killWorker(first);
+
+        if (recovery !== undefined && recovery.child.exitCode === null) {
+            await killWorker(recovery);
+        }
+
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("reopen fences a not-completed turn instead of retrying its logical turn ID", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-pocket-agent-not-completed-turn-"));
+    const database = join(directory, "agent.sqlite");
+    const markers = join(directory, "provider-dispatches.log");
+    const first = startWorker("start", database, markers, "turn-not-completed-classified");
+    let recovery: Worker | undefined;
+
+    try {
+        await outputUntil(first, "BOUNDARY:turn-not-completed-classified");
+        await killWorker(first);
+        assert.deepEqual(await dispatchMarkers(markers), []);
+
+        recovery = startWorker("recover", database, markers);
+        const output = await outputUntil(recovery, "FINAL:");
+
+        await successfulExit(recovery);
+
+        const beforeRecovery = payloadAfter(output, "PRE-RECOVERY:") as {
+            threadStatus: string;
+            turnStatus: string;
+            runnerStatus: string;
+            runnerAbortRequested: boolean;
+            ownerStatus: string;
+            ownerAbortRequested: boolean;
+            ownerTaskId: number;
+            ownerConversationId: number;
+            ownerRunId: string;
+            runStatus: string;
+            runTaskId: number;
+            runHasStopCommand: boolean;
+            runHasSelectedOutcome: boolean;
+            threadProviderSessionId: string;
+            providerSessionId: string;
+            nativeConversationOwner: { taskId: number; conversationId: number };
+        };
+        const preopen = payloadAfter(output, "PREOPEN:") as {
+            status: string;
+            turns: { turnId: string; status: string }[];
+        };
+        const final = payloadAfter(output, "FINAL:");
+        const thread = final.thread as {
+            status: string;
+            turns: { turnId: string; status: string }[];
+        };
+        const runner = final.runner as {
+            state: { status: string; outcome?: { status: string } };
+        };
+
+        assert.equal(beforeRecovery.threadStatus, "ready");
+        assert.equal(beforeRecovery.turnStatus, "not-completed");
+        assert.equal(beforeRecovery.runnerStatus, "pending");
+        assert.equal(beforeRecovery.runnerAbortRequested, false);
+        assert.equal(beforeRecovery.ownerStatus, "pending");
+        assert.equal(beforeRecovery.ownerAbortRequested, false);
+        assert.equal(beforeRecovery.ownerTaskId, beforeRecovery.runTaskId);
+        assert.equal(beforeRecovery.ownerRunId, "agent-crash-run");
+        assert.equal(beforeRecovery.runStatus, "running");
+        assert.equal(beforeRecovery.runHasStopCommand, false);
+        assert.equal(beforeRecovery.runHasSelectedOutcome, false);
+        assert.equal(beforeRecovery.nativeConversationOwner?.taskId, beforeRecovery.ownerTaskId);
+        assert.equal(
+            beforeRecovery.nativeConversationOwner?.conversationId,
+            beforeRecovery.ownerConversationId,
+        );
+        assert.equal(beforeRecovery.threadProviderSessionId, beforeRecovery.providerSessionId);
+        assert.equal(preopen.status, "unknown");
+        assert.equal(preopen.turns[0]?.status, "unknown");
+        assert.equal(thread.status, "unknown");
+        assert.equal(thread.turns[0]?.status, "unknown");
+        assert.equal(runner.state.status, "terminal");
+        assert.equal(runner.state.outcome?.status, "aborted");
+        assert.deepEqual(await dispatchMarkers(markers), []);
+    } finally {
+        await killWorker(first);
+
+        if (recovery !== undefined && recovery.child.exitCode === null) {
+            await killWorker(recovery);
+        }
+
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("reopen rejects stale and duplicate raw AgentDoc selections before provider progress", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-pocket-agent-raw-selection-"));
+    const database = join(directory, "agent.sqlite");
+    const markers = join(directory, "provider-dispatches.log");
+    const first = startWorker("start", database, markers, "agent-selection-malformed-committed");
+    let recovery: Worker | undefined;
+
+    try {
+        await outputUntil(first, "BOUNDARY:agent-selection-malformed-committed");
+        await killWorker(first);
+        assert.deepEqual(await dispatchMarkers(markers), []);
+
+        recovery = startWorker("recover", database, markers);
+        const output = await outputUntil(recovery, "FINAL:");
+
+        await successfulExit(recovery);
+
+        const beforeRecovery = payloadAfter(output, "PRE-RECOVERY:") as {
+            agentExtensions: string[];
+            agentTools: string[];
+        };
+        const preopen = payloadAfter(output, "PREOPEN:") as {
+            status: string;
+            turns: { turnId: string; status: string }[];
+        };
+        const final = payloadAfter(output, "FINAL:");
+        const thread = final.thread as {
+            status: string;
+            turns: { turnId: string; status: string }[];
+        };
+        const runner = final.runner as {
+            state: { status: string; outcome?: { status: string } };
+        };
+
+        assert.deepEqual(beforeRecovery.agentExtensions, [
+            "crash-fixture-unsafe-effect",
+            "missing-agent-extension",
+            "crash-fixture-unsafe-effect",
+        ]);
+        assert.deepEqual(beforeRecovery.agentTools, [
+            "unsafe_effect",
+            "missing-agent-tool",
+            "unsafe_effect",
+        ]);
+        assert.equal(preopen.status, "unknown");
+        assert.equal(preopen.turns[0]?.status, "unknown");
+        assert.equal(thread.status, "unknown");
+        assert.equal(thread.turns[0]?.status, "unknown");
+        assert.equal(runner.state.status, "terminal");
+        assert.equal(runner.state.outcome?.status, "aborted");
+        assert.deepEqual(await dispatchMarkers(markers), []);
+    } finally {
+        await killWorker(first);
+
+        if (recovery !== undefined && recovery.child.exitCode === null) {
+            await killWorker(recovery);
+        }
+
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("reopen fences malformed selections with an active safe ToolTask before native Agent resolution", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-pocket-agent-raw-selection-safe-tool-"));
+    const database = join(directory, "agent.sqlite");
+    const markers = join(directory, "provider-dispatches.log");
+    const toolMarkers = `${markers}.tools`;
+    const boundary = "agent-selection-malformed-safe-tool";
+    const first = startWorker("start", database, markers, boundary);
+    let recovery: Worker | undefined;
+
+    try {
+        await outputUntil(first, `BOUNDARY:${boundary}`);
+        await killWorker(first);
+        assert.deepEqual(await dispatchMarkers(markers), [
+            "faux-provider-dispatch",
+            "faux-provider-dispatch",
+        ]);
+        assert.deepEqual(await dispatchMarkers(toolMarkers), ["faux-tool-dispatch"]);
+
+        recovery = startWorker("recover", database, markers, boundary);
+        const output = await outputUntil(recovery, "FINAL:");
+
+        await successfulExit(recovery);
+
+        const preopen = payloadAfter(output, "PREOPEN:") as {
+            status: string;
+            turns: { turnId: string; status: string }[];
+        };
+        const final = payloadAfter(output, "FINAL:");
+        const thread = final.thread as {
+            status: string;
+            turns: { turnId: string; status: string }[];
+        };
+        const runner = final.runner as {
+            state: { status: string; outcome?: { status: string } };
+        };
+        const nativeTasks = final.nativeTasks as {
+            kind: string;
+            status: string;
+            outcome?: string;
+        }[];
+
+        assert.equal(final.nativeAgentResolutionAttempted, false);
+        assert.ok(preopen.turns.some((turn) => turn.turnId === "crash-turn"));
+        assert.equal(thread.status, "unknown");
+        assert.equal(thread.turns.find((turn) => turn.turnId === "crash-turn")?.status, "unknown");
+        assert.equal(runner.state.status, "terminal");
+        assert.equal(runner.state.outcome?.status, "aborted");
+        assert.ok(
+            nativeTasks.some(
+                (task) =>
+                    task.kind === "pi.tool" &&
+                    task.status === "terminal" &&
+                    task.outcome === "aborted",
+            ),
+            JSON.stringify(nativeTasks),
+        );
+        assert.deepEqual(await dispatchMarkers(markers), [
+            "faux-provider-dispatch",
+            "faux-provider-dispatch",
+        ]);
+        assert.deepEqual(await dispatchMarkers(toolMarkers), ["faux-tool-dispatch"]);
+    } finally {
+        await killWorker(first);
+
+        if (recovery !== undefined && recovery.child.exitCode === null) {
+            await killWorker(recovery);
+        }
+
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("reopen fences a numeric-string submission reference before provider progress", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-pocket-agent-string-submission-reference-"));
+    const database = join(directory, "agent.sqlite");
+    const markers = join(directory, "provider-dispatches.log");
+    const first = startWorker("start", database, markers, "mapping-committed");
+    let recovery: Worker | undefined;
+
+    try {
+        await outputUntil(first, "BOUNDARY:mapping-committed");
+        await killWorker(first);
+        assert.deepEqual(await dispatchMarkers(markers), []);
+
+        recovery = startWorker("recover", database, markers, "tamper-turn-submission-id-string");
+        const output = await outputUntil(recovery, "FINAL:");
+
+        await successfulExit(recovery);
+        assert.match(output, /SETUP:TAMPERED:turn-submission-id-string:[0-9]+/);
+        const preopen = payloadAfter(output, "PREOPEN:") as {
+            status: string;
+            turns: { status: string }[];
+        };
+        const final = payloadAfter(output, "FINAL:");
+        const thread = final.thread as {
+            status: string;
+            turns: { status: string }[];
+        };
+        const runner = final.runner as { state: { status: string; outcome?: { status: string } } };
+
+        assert.equal(preopen.status, "unknown");
+        assert.equal(preopen.turns[0]?.status, "unknown");
+        assert.equal(thread.status, "unknown");
+        assert.equal(thread.turns[0]?.status, "unknown");
+        assert.equal(runner.state.status, "terminal");
+        assert.equal(runner.state.outcome?.status, "aborted");
+        assert.deepEqual(await dispatchMarkers(markers), []);
+    } finally {
+        await killWorker(first);
+
+        if (recovery !== undefined && recovery.child.exitCode === null) {
+            await killWorker(recovery);
+        }
+
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("reopen fences orphan native work when its ProviderDoc mapping is missing", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-pocket-agent-orphan-provider-"));
+    const database = join(directory, "agent.sqlite");
+    const markers = join(directory, "provider-dispatches.log");
+    const first = startWorker("start", database, markers, "provider-dispatched");
+    let tamper: Worker | undefined;
+    let recovery: Worker | undefined;
+
+    try {
+        await outputUntil(first, "BOUNDARY:provider-dispatched");
+        await killWorker(first);
+        assert.deepEqual(await dispatchMarkers(markers), ["faux-provider-dispatch"]);
+
+        tamper = startWorker("orphan-missing-provider", database, markers);
+        const tampered = await outputUntil(tamper, "ORPHANED:");
+
+        await successfulExit(tamper);
+        assert.match(tampered, /provider-mapping-missing-runner-terminal/);
+
+        recovery = startWorker("recover", database, markers);
+        const output = await outputUntil(recovery, "FINAL:");
+
+        await successfulExit(recovery);
+
+        const final = payloadAfter(output, "FINAL:");
+        const thread = final.thread as {
+            status: string;
+            turns: { status: string }[];
+        };
+        const nativeTasks = final.nativeTasks as {
+            kind: string;
+            status: string;
+            outcome?: string;
+        }[];
+
+        assert.equal(
+            thread.status,
+            "unknown",
+            JSON.stringify({ thread, nativeTasks, markers: await dispatchMarkers(markers) }),
+        );
+        assert.equal(thread.turns[0]?.status, "unknown");
+        assert.ok(
+            nativeTasks.some(
+                (task) =>
+                    task.kind === "pi.generation" &&
+                    task.status === "terminal" &&
+                    task.outcome === "aborted",
+            ),
+        );
+        assert.deepEqual(await dispatchMarkers(markers), ["faux-provider-dispatch"]);
+    } finally {
+        await killWorker(first);
+
+        if (tamper !== undefined && tamper.child.exitCode === null) {
+            await killWorker(tamper);
+        }
+
+        if (recovery !== undefined && recovery.child.exitCode === null) {
+            await killWorker(recovery);
+        }
+
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("reopen aborts orphan native work correlated only by terminal runner conversation ownership", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-pocket-agent-orphan-both-missing-"));
+    const database = join(directory, "agent.sqlite");
+    const markers = join(directory, "provider-dispatches.log");
+    const first = startWorker("start", database, markers, "provider-dispatched");
+    let tamper: Worker | undefined;
+    let recovery: Worker | undefined;
+
+    try {
+        await outputUntil(first, "BOUNDARY:provider-dispatched");
+        await killWorker(first);
+        assert.deepEqual(await dispatchMarkers(markers), ["faux-provider-dispatch"]);
+
+        tamper = startWorker("orphan-missing-thread-and-provider", database, markers);
+        const tampered = await outputUntil(tamper, "ORPHANED:");
+
+        await successfulExit(tamper);
+        const orphaned = payloadAfter(tampered, "ORPHANED:") as {
+            reason: string;
+            conversationId: number;
+            runnerTaskId: number;
+            threadStillCurrent: boolean;
+        };
+
+        assert.equal(orphaned.reason, "thread-and-provider-mapping-missing-runner-terminal");
+        assert.equal(orphaned.threadStillCurrent, false);
+
+        recovery = startWorker("recover", database, markers);
+        const output = await outputUntil(recovery, "FINAL:");
+
+        await successfulExit(recovery);
+
+        const final = payloadAfter(output, "FINAL:");
+        const runner = final.runner as {
+            id: number;
+            state: { status: string; outcome?: { status: string } };
+        };
+        const nativeTasks = final.nativeTasks as {
+            id: number;
+            conversationId: number;
+            kind: string;
+            status: string;
+            outcome?: string;
+        }[];
+        const replacementThread = final.thread as { conversationId: number } | undefined;
+
+        assert.equal(runner.id, orphaned.runnerTaskId);
+        assert.equal(runner.state.status, "terminal");
+        assert.equal(runner.state.outcome?.status, "aborted");
+        assert.notEqual(replacementThread?.conversationId, orphaned.conversationId);
+        assert.ok(
+            nativeTasks.some(
+                (task) =>
+                    task.conversationId === orphaned.conversationId &&
+                    task.kind === "pi.generation" &&
+                    task.status === "terminal" &&
+                    task.outcome === "aborted",
+            ),
+            JSON.stringify({ nativeTasks, markers: await dispatchMarkers(markers) }),
+        );
+        assert.deepEqual(await dispatchMarkers(markers), ["faux-provider-dispatch"]);
+    } finally {
+        await killWorker(first);
+
+        if (tamper !== undefined && tamper.child.exitCode === null) {
+            await killWorker(tamper);
+        }
+
+        if (recovery !== undefined && recovery.child.exitCode === null) {
+            await killWorker(recovery);
+        }
+
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("reopen recreates the private section view before resuming native work", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-pocket-agent-section-view-crash-"));
+    const database = join(directory, "agent.sqlite");
+    const markers = join(directory, "provider-dispatches.log");
+    const first = startWorker("start", database, markers, "section-view-submission-committed");
+    let recovery: Worker | undefined;
+
+    try {
+        const submitted = await outputUntil(first, "BOUNDARY:submission-committed:");
+        const submissionBoundary = payloadAfter(submitted, "BOUNDARY:submission-committed:");
+
+        await killWorker(first);
+        assert.equal(submissionBoundary.status, "placed");
+        assert.deepEqual(await dispatchMarkers(markers), []);
+
+        recovery = startWorker("recover", database, markers, "section-view-submission-committed");
+        const output = await outputUntil(recovery, "FINAL:");
+
+        await successfulExit(recovery);
+
+        const preopen = payloadAfter(output, "PREOPEN:");
+        const preopenAuthorityInput = preopen.authorityInput as {
+            readonly selectionViews: readonly {
+                readonly sourceName: string;
+                readonly selectedName: string;
+                readonly sections: readonly string[];
+            }[];
+        };
+        const final = payloadAfter(output, "FINAL:");
+        const thread = final.thread as {
+            status: string;
+            turns: { status: string }[];
+        };
+
+        assert.deepEqual(preopenAuthorityInput.selectionViews[0]?.sections, [
+            "crash-section-alpha",
+        ]);
+        assert.match(
+            preopenAuthorityInput.selectionViews[0]?.selectedName ?? "",
+            /^pocket\.workflow-runtime\.agent-section-view:/,
+        );
+        assert.equal(thread.status, "ready");
+        assert.equal(thread.turns[0]?.status, "completed");
+        assert.deepEqual(await dispatchMarkers(markers), ["faux-provider-dispatch"]);
     } finally {
         await killWorker(first);
 

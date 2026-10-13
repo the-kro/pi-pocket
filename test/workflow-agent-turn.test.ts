@@ -826,7 +826,7 @@ test("an exact native answer repairs a missing adapter submission receipt", asyn
         assert.ok(answerEntry);
         assert.ok(runner);
         assert.equal(runner.state.status, "terminal");
-        assert.equal(runner.state.outcome.status, "faulted");
+        assert.equal(runner.state.outcome.status, "completed");
         assert.deepEqual(result.replay, completedTurn.result);
         assert.deepEqual(completedTurn.result, answerEntry.model?.[0]);
         assert.equal(result.replay.content[0]?.text, "exact native answer recovered");

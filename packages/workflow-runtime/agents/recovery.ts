@@ -1,14 +1,20 @@
 import type { Context, JsonValue } from "@earendil-works/chord";
 import {
+    AssistantEntry,
     type ConversationId,
+    type Cursor,
+    type EntryId,
     Harness,
     ProviderDoc,
     UserEntry,
     type TaskId,
+    type Storage,
+    type TaskRecord,
 } from "@earendil-works/pi-durable";
 import { canonicalInput } from "../core/identity.ts";
 import {
     type AgentThreadIdentity,
+    type WorkflowAgentReviewIdentity,
     hasWorkflowAgentProviderSessionIdPrefix,
     parseWorkflowAgentProviderSessionId,
     workflowAgentThreadKey,
@@ -17,11 +23,272 @@ import { RUN_DOC } from "../core/index.ts";
 import {
     AGENT_RUNNER_TASK_NAME,
     AGENT_THREAD_DOC,
+    type AgentThreadRecord,
     WorkflowAgentAdmissionError,
 } from "./records.ts";
 import { workflowAgentRunnerIntentMatches } from "./runner.ts";
 
-export async function recoverAgentRunnerTasks(harness: Harness, context: Context): Promise<void> {
+function persistedJsonMatches(left: unknown, right: unknown): boolean {
+    if (left === undefined || right === undefined) {
+        return left === right;
+    }
+
+    try {
+        return (
+            canonicalInput(left as JsonValue).canonical ===
+            canonicalInput(right as JsonValue).canonical
+        );
+    } catch {
+        return false;
+    }
+}
+
+export type WorkflowAgentRecoveryAuthorityCheck = (
+    thread: AgentThreadRecord,
+    runnerInput: JsonValue,
+) => boolean | Promise<boolean>;
+
+async function canSafelyReplayToolTask(
+    harness: Harness,
+    task: TaskRecord<JsonValue, JsonValue, unknown>,
+    reference: { readonly taskId: TaskId; readonly generationTaskId: TaskId },
+    conversationId: ConversationId | undefined,
+    thread: AgentThreadRecord,
+    turnId: unknown,
+    context: Context,
+): Promise<boolean> {
+    const checkpoint = task.state.checkpoint as unknown as Record<string, unknown>;
+
+    if (
+        task.kind !== "pi.tool" ||
+        task.id !== reference.taskId ||
+        task.owner !== reference.generationTaskId ||
+        task.conversationId !== conversationId ||
+        task.abortRequested ||
+        task.state.status === "terminal" ||
+        task.state.status === "completing" ||
+        checkpoint.phase !== "execute" ||
+        checkpoint.replay !== "safe" ||
+        typeof turnId !== "string"
+    ) {
+        return false;
+    }
+
+    const input = task.input as { readonly assistant?: unknown; readonly callId?: unknown };
+
+    if (
+        typeof input.assistant !== "number" ||
+        !Number.isSafeInteger(input.assistant) ||
+        input.assistant <= 0 ||
+        typeof input.callId !== "string"
+    ) {
+        return false;
+    }
+
+    const assistant = await harness.commit(
+        (tx) => tx.entry(AssistantEntry, input.assistant as EntryId),
+        context,
+    );
+    const message = assistant?.model?.[0];
+    const candidate =
+        message?.role === "assistant"
+            ? message.content.find((item) => item.type === "toolCall" && item.id === input.callId)
+            : undefined;
+
+    if (candidate?.type !== "toolCall") {
+        return false;
+    }
+
+    const call = candidate;
+
+    const conversation = await harness.conversation(conversationId!, context);
+    const agent = await conversation?.agent(context);
+    const tool = agent?.tools.find((candidate) => candidate.name === call.name);
+    const turn = thread.turns?.find((candidate) => candidate.turnId === turnId);
+
+    if (
+        tool?.replay !== "safe" ||
+        turn === undefined ||
+        typeof turn.effectiveAuthority !== "object" ||
+        turn.effectiveAuthority === null ||
+        Array.isArray(turn.effectiveAuthority)
+    ) {
+        return false;
+    }
+
+    const effectiveAuthority = turn.effectiveAuthority as {
+        readonly tools?: unknown;
+    };
+
+    return (
+        Array.isArray(effectiveAuthority.tools) &&
+        effectiveAuthority.tools.some(
+            (authorized) =>
+                typeof authorized === "object" &&
+                authorized !== null &&
+                !Array.isArray(authorized) &&
+                "name" in authorized &&
+                authorized.name === call.name,
+        )
+    );
+}
+
+type PersistedAgentThreadReference = {
+    readonly key: string;
+    readonly conversationId: number;
+};
+
+async function registerPersistedAgentConversations(
+    storage: Storage,
+    context: Context,
+    registerConversation: (conversationId: number) => void,
+): Promise<Map<number, PersistedAgentThreadReference[]>> {
+    const threadsByConversation = new Map<number, PersistedAgentThreadReference[]>();
+    let cursor: Cursor | undefined;
+
+    do {
+        const page = await storage.scanDocuments(
+            {
+                scope: { kind: "session" },
+                at: "current",
+                kind: AGENT_THREAD_DOC.definition.kind,
+            },
+            100,
+            cursor,
+            context,
+        );
+
+        for (const document of page.items) {
+            const stored = await storage.document(document.id, "current", context);
+            const record = stored?.value as unknown as Partial<AgentThreadRecord> | undefined;
+            const conversationId = record?.conversationId;
+
+            if (
+                typeof conversationId === "number" &&
+                Number.isSafeInteger(conversationId) &&
+                conversationId > 0
+            ) {
+                registerConversation(conversationId);
+
+                const key =
+                    typeof document.key === "string" && document.key.length > 0
+                        ? document.key
+                        : typeof record?.threadKey === "string" && record.threadKey.length > 0
+                          ? record.threadKey
+                          : undefined;
+
+                if (key !== undefined) {
+                    const references = threadsByConversation.get(conversationId) ?? [];
+
+                    references.push({ key, conversationId });
+                    threadsByConversation.set(conversationId, references);
+                }
+            }
+        }
+
+        cursor = page.next;
+    } while (cursor !== undefined);
+
+    return threadsByConversation;
+}
+
+async function registerPersistedAgentRunnerConversations(
+    storage: Storage,
+    context: Context,
+    registerConversation: (conversationId: number) => void,
+): Promise<Set<number>> {
+    const conversationIds = new Set<number>();
+    let cursor: Cursor | undefined;
+
+    do {
+        const page = await storage.scanTasks(
+            { kind: AGENT_RUNNER_TASK_NAME },
+            100,
+            cursor,
+            context,
+        );
+
+        for (const task of page.items) {
+            if (task.kind !== AGENT_RUNNER_TASK_NAME) {
+                continue;
+            }
+
+            const input = task.input as { readonly conversationId?: unknown } | undefined;
+            const conversationId = input?.conversationId;
+
+            if (
+                typeof conversationId !== "number" ||
+                !Number.isSafeInteger(conversationId) ||
+                conversationId <= 0
+            ) {
+                continue;
+            }
+
+            conversationIds.add(conversationId);
+            registerConversation(conversationId);
+        }
+
+        cursor = page.next;
+    } while (cursor !== undefined);
+
+    return conversationIds;
+}
+
+async function fencePersistedAgentThreads(
+    harness: Harness,
+    references: readonly PersistedAgentThreadReference[],
+    conversationId: ConversationId,
+    reason: string,
+    context: Context,
+): Promise<void> {
+    for (const reference of references) {
+        if (reference.conversationId !== Number(conversationId)) {
+            continue;
+        }
+
+        await harness.commit(async (tx) => {
+            const current = await tx.doc(AGENT_THREAD_DOC, reference.key, reference.key);
+
+            if (current.conversationId !== conversationId) {
+                return;
+            }
+
+            if (current.status !== "closed") {
+                current.status = "unknown";
+            }
+
+            for (const turn of current.turns ?? []) {
+                if (turn.status !== "completed") {
+                    turn.status = "unknown";
+                }
+            }
+
+            current.unknownReason = reason;
+        }, context);
+    }
+}
+
+export function canRecoverDefinitelyNotSubmittedTurn(input: {
+    readonly activeWorkflowOwner: boolean;
+    readonly exactTurn: boolean;
+    readonly submission: unknown;
+    readonly turnStatus: string | undefined;
+}): boolean {
+    return (
+        input.activeWorkflowOwner &&
+        input.exactTurn &&
+        input.submission === undefined &&
+        input.turnStatus === "reserved"
+    );
+}
+
+export async function recoverAgentRunnerTasks(
+    harness: Harness,
+    context: Context,
+    authorityIsCurrent: WorkflowAgentRecoveryAuthorityCheck,
+    storage: Storage,
+    registerConversation: (conversationId: number) => void,
+): Promise<void> {
     const inspection = await harness.inspect(context);
 
     if (inspection.scheduling !== "paused") {
@@ -29,6 +296,17 @@ export async function recoverAgentRunnerTasks(harness: Harness, context: Context
             "Agent recovery must attach before Harness scheduling resumes",
         );
     }
+
+    const persistedAgentThreads = await registerPersistedAgentConversations(
+        storage,
+        context,
+        registerConversation,
+    );
+    const persistedAgentRunnerConversationIds = await registerPersistedAgentRunnerConversations(
+        storage,
+        context,
+        registerConversation,
+    );
 
     const allTasks = inspection.tasks.map((task) => task.record);
     const activeTasks = allTasks.filter(
@@ -51,6 +329,9 @@ export async function recoverAgentRunnerTasks(harness: Harness, context: Context
             readonly intentDigest?: unknown;
             readonly content?: unknown;
             readonly workflowTaskId?: unknown;
+            readonly purpose?: unknown;
+            readonly reviewerIdentity?: unknown;
+            readonly freshThread?: unknown;
         };
 
         if (
@@ -111,6 +392,16 @@ export async function recoverAgentRunnerTasks(harness: Harness, context: Context
                 content: input.content as JsonValue,
                 intentCanonical: input.intentCanonical,
                 intentDigest: input.intentDigest,
+                ...(input.purpose === undefined ? {} : { purpose: input.purpose as "review" }),
+                ...(input.reviewerIdentity === undefined
+                    ? {}
+                    : {
+                          reviewerIdentity:
+                              input.reviewerIdentity as unknown as WorkflowAgentReviewIdentity,
+                      }),
+                ...(input.freshThread === undefined
+                    ? {}
+                    : { freshThread: input.freshThread as boolean }),
             });
         const exactTurn =
             task.version === 1 &&
@@ -128,13 +419,18 @@ export async function recoverAgentRunnerTasks(harness: Harness, context: Context
             turn.turnId === input.turnId &&
             turn.requestId === requestId &&
             turn.intentCanonical === input.intentCanonical &&
-            turn.intentDigest === input.intentDigest;
+            turn.intentDigest === input.intentDigest &&
+            turn.purpose === input.purpose &&
+            turn.freshThread === input.freshThread &&
+            persistedJsonMatches(turn.reviewerIdentity, input.reviewerIdentity);
         const nativeConversationId =
             typeof existing.conversationId === "number" &&
             Number.isSafeInteger(existing.conversationId) &&
             existing.conversationId > 0
                 ? (existing.conversationId as ConversationId)
                 : undefined;
+        const currentAuthority = await authorityIsCurrent(existing, task.input as JsonValue);
+
         const nativeTasks =
             nativeConversationId === undefined
                 ? []
@@ -199,18 +495,48 @@ export async function recoverAgentRunnerTasks(harness: Harness, context: Context
                 task: await harness.getTask(reference.taskId, context),
             })),
         );
-        // A missing, mismatched, failed, or aborted tool Task cannot prove its external effect did not occur.
-        const uncertainTerminalToolEffect =
-            malformedToolTaskReference ||
-            observedToolTasks.some(
-                ({ reference, task: toolTask }) =>
-                    toolTask === undefined ||
-                    toolTask.kind !== "pi.tool" ||
-                    toolTask.owner !== reference.generationTaskId ||
-                    toolTask.conversationId !== nativeConversationId ||
-                    toolTask.state.status !== "terminal" ||
-                    toolTask.state.outcome.status !== "completed",
-            );
+        // A completed tool task is settled. An interrupted execute-phase task is replayable only
+        // when both its durable intent and the current implementation prove the replay is safe.
+        const safelyReplayableToolTaskIds = new Set<number>();
+        let uncertainTerminalToolEffect = malformedToolTaskReference;
+
+        for (const { reference, task: toolTask } of observedToolTasks) {
+            if (
+                toolTask === undefined ||
+                toolTask.kind !== "pi.tool" ||
+                toolTask.owner !== reference.generationTaskId ||
+                toolTask.conversationId !== nativeConversationId
+            ) {
+                uncertainTerminalToolEffect = true;
+                continue;
+            }
+
+            if (toolTask.state.status === "terminal") {
+                if (toolTask.state.outcome.status !== "completed") {
+                    uncertainTerminalToolEffect = true;
+                }
+
+                continue;
+            }
+
+            // Resolve the native Agent only after persisted selection validation succeeds.
+            if (
+                currentAuthority &&
+                (await canSafelyReplayToolTask(
+                    harness,
+                    toolTask,
+                    reference,
+                    nativeConversationId,
+                    existing,
+                    input.turnId,
+                    context,
+                ))
+            ) {
+                safelyReplayableToolTaskIds.add(Number(toolTask.id));
+            } else if (currentAuthority) {
+                uncertainTerminalToolEffect = true;
+            }
+        }
 
         for (const nativeTask of activeNativeTasks) {
             handledNativeTaskIds.add(Number(nativeTask.id));
@@ -280,7 +606,11 @@ export async function recoverAgentRunnerTasks(harness: Harness, context: Context
 
         const exactSubmissionReference =
             turn?.submissionId === undefined ||
-            (submission !== undefined && Number(turn.submissionId) === Number(submission.id));
+            (typeof turn.submissionId === "number" &&
+                Number.isSafeInteger(turn.submissionId) &&
+                typeof submission?.id === "number" &&
+                Number.isSafeInteger(submission.id) &&
+                turn.submissionId === submission.id);
         const exactPlacedSubmission =
             submission?.type === "input" &&
             submission.status === "placed" &&
@@ -305,12 +635,14 @@ export async function recoverAgentRunnerTasks(harness: Harness, context: Context
             submission.answer !== undefined &&
             nativeInputMatchesIntent &&
             exactSubmissionReference;
-        const definitelyNotSubmitted =
-            activeWorkflowOwner &&
-            exactTurn &&
-            submission === undefined &&
-            (turn?.status === "reserved" || turn?.status === "not-completed");
+        const definitelyNotSubmitted = canRecoverDefinitelyNotSubmittedTurn({
+            activeWorkflowOwner,
+            exactTurn,
+            submission,
+            turnStatus: turn?.status,
+        });
         const safelyResumableProviderWork =
+            currentAuthority &&
             !uncertainTerminalToolEffect &&
             activeWorkflowOwner &&
             !task.abortRequested &&
@@ -322,10 +654,14 @@ export async function recoverAgentRunnerTasks(harness: Harness, context: Context
             activeNativeTasks.every(
                 (candidate) =>
                     !candidate.abortRequested &&
-                    (candidate.kind === "pi.generation" || candidate.kind === "pi.compaction"),
+                    (candidate.kind === "pi.generation" ||
+                        candidate.kind === "pi.compaction" ||
+                        (candidate.kind === "pi.tool" &&
+                            safelyReplayableToolTaskIds.has(Number(candidate.id)))),
             );
 
         if (
+            currentAuthority &&
             !uncertainTerminalToolEffect &&
             ((activeWorkflowOwner &&
                 !task.abortRequested &&
@@ -336,8 +672,9 @@ export async function recoverAgentRunnerTasks(harness: Harness, context: Context
         ) {
             // A missing submission proves no provider request was scheduled; an exact done
             // submission is replayed from its answer reference. Active Generation/Compaction tasks
-            // are resumed by Pi Durable under its standard retry semantics. Any live tool or unknown
-            // task kind remains fenced below.
+            // use Pi Durable's retry semantics. An interrupted ToolTask is allowed only when its
+            // persisted execute intent and current safe implementation agree; the host guard still
+            // revalidates admission, selection, and arguments at actual execution.
             continue;
         }
 
@@ -366,9 +703,18 @@ export async function recoverAgentRunnerTasks(harness: Harness, context: Context
                 currentTurn.status = "unknown";
             }
 
-            current.unknownReason = activeWorkflowOwner
-                ? "An interrupted native tool or unsupported task cannot be safely resumed"
-                : "Workflow owner stopped or changed before native recovery";
+            if (!currentAuthority) {
+                current.unknownReason =
+                    "Agent profile authority or model fingerprint changed before native recovery";
+            } else if (uncertainTerminalToolEffect) {
+                current.unknownReason =
+                    "An interrupted native tool effect is not proven safe to replay";
+            } else if (activeWorkflowOwner) {
+                current.unknownReason = "Native provider work is unsupported for safe recovery";
+            } else {
+                current.unknownReason = "Workflow owner stopped or changed before native recovery";
+            }
+
             current.nativeRunnerTaskId = runnerTaskId;
         }, context);
 
@@ -390,55 +736,89 @@ export async function recoverAgentRunnerTasks(harness: Harness, context: Context
         }
 
         const conversationId = Number(nativeTask.conversationId) as ConversationId;
+        const persistedThreads = persistedAgentThreads.get(Number(conversationId)) ?? [];
         const provider = await harness.snapshot(ProviderDoc, conversationId, context);
         const sessionId = provider?.sessionId;
 
         if (sessionId === undefined || !hasWorkflowAgentProviderSessionIdPrefix(sessionId)) {
+            if (
+                persistedThreads.length === 0 &&
+                !persistedAgentRunnerConversationIds.has(Number(conversationId))
+            ) {
+                continue;
+            }
+
+            await fencePersistedAgentThreads(
+                harness,
+                persistedThreads,
+                conversationId,
+                "Adapter-owned native task lacks its exact ProviderDoc/thread correlation",
+                context,
+            );
+            await harness.abortTask(nativeTask.id as TaskId, context);
             continue;
         }
 
         const parsed = parseWorkflowAgentProviderSessionId(sessionId);
 
-        if (parsed !== undefined) {
-            const thread = await harness.snapshot(AGENT_THREAD_DOC, parsed.key, context);
+        if (parsed === undefined) {
+            await fencePersistedAgentThreads(
+                harness,
+                persistedThreads,
+                conversationId,
+                "Adapter-owned native task has a malformed ProviderDoc/thread correlation",
+                context,
+            );
+            await harness.abortTask(nativeTask.id as TaskId, context);
+            continue;
+        }
 
-            if (
-                thread !== undefined &&
-                thread.schemaVersion === 1 &&
-                thread.threadKey === parsed.key &&
-                thread.runId === parsed.identity.runId &&
-                thread.threadId === parsed.identity.threadId &&
-                thread.profileId === parsed.identity.profileId &&
-                thread.conversationId === conversationId &&
-                thread.providerSessionId === sessionId
-            ) {
-                await harness.commit(async (tx) => {
-                    const current = await tx.doc(AGENT_THREAD_DOC, parsed.key, parsed.key);
+        const thread = await harness.snapshot(AGENT_THREAD_DOC, parsed.key, context);
+        const exactThreadMatch =
+            thread !== undefined &&
+            thread.schemaVersion === 1 &&
+            thread.threadKey === parsed.key &&
+            thread.runId === parsed.identity.runId &&
+            thread.threadId === parsed.identity.threadId &&
+            thread.profileId === parsed.identity.profileId &&
+            thread.conversationId === conversationId &&
+            thread.providerSessionId === sessionId;
 
-                    if (
-                        current.runId !== parsed.identity.runId ||
-                        current.threadId !== parsed.identity.threadId ||
-                        current.profileId !== parsed.identity.profileId ||
-                        current.providerSessionId !== sessionId ||
-                        current.conversationId !== conversationId
-                    ) {
-                        return;
+        if (exactThreadMatch) {
+            await harness.commit(async (tx) => {
+                const current = await tx.doc(AGENT_THREAD_DOC, parsed.key, parsed.key);
+
+                if (
+                    current.runId !== parsed.identity.runId ||
+                    current.threadId !== parsed.identity.threadId ||
+                    current.profileId !== parsed.identity.profileId ||
+                    current.providerSessionId !== sessionId ||
+                    current.conversationId !== conversationId
+                ) {
+                    return;
+                }
+
+                if (current.status !== "closed") {
+                    current.status = "unknown";
+                }
+
+                for (const turn of current.turns ?? []) {
+                    if (turn.status !== "completed") {
+                        turn.status = "unknown";
                     }
+                }
 
-                    if (current.status !== "closed") {
-                        current.status = "unknown";
-                    }
-
-                    for (const turn of current.turns ?? []) {
-                        if (turn.status !== "completed") {
-                            turn.status = "unknown";
-                        }
-                    }
-
-                    current.unknownReason =
-                        "Adapter-owned native task has no matching active workflow runner";
-                }, context);
-            }
+                current.unknownReason =
+                    "Adapter-owned native task has no matching active workflow runner";
+            }, context);
+        } else if (persistedThreads.length > 0) {
+            await fencePersistedAgentThreads(
+                harness,
+                persistedThreads,
+                conversationId,
+                "Adapter-owned native task has no exact ProviderDoc/thread correlation",
+                context,
+            );
         }
 
         await harness.abortTask(nativeTask.id as TaskId, context);
