@@ -6,7 +6,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { canRecoverDefinitelyNotSubmittedTurn } from "../packages/workflow-runtime/agents/recovery.ts";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { Storage } from "@earendil-works/pi-durable";
+import { AGENT_RUNNER_TASK_NAME } from "../packages/workflow-runtime/agents/records.ts";
+import {
+    canRecoverDefinitelyNotSubmittedTurn,
+    recoverAgentRunnerTasks,
+} from "../packages/workflow-runtime/agents/recovery.ts";
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const crashWorker = join(projectRoot, "test/fixtures/workflow-agent-crash-worker.ts");
@@ -42,7 +48,13 @@ function markDispatch(dispatch) {
     writeSync(1, "REVIEW-DISPATCHED-" + dispatch + "\n");
 }
 
-const { AGENT_THREAD_DOC, createWorkflowAgentRuntime, workflowAgentThreadKey } = await import(
+const {
+    AGENT_THREAD_DOC,
+    createWorkflowAgentReviewAdmissionPolicy,
+    createWorkflowAgentReviewPolicyBinding,
+    createWorkflowAgentRuntime,
+    workflowAgentThreadKey,
+} = await import(
     pathToFileURL(join(root, "packages/workflow-runtime/index.ts")).href
 );
 const { defineWorkflow } = await import(
@@ -90,15 +102,20 @@ const profile = {
     model: { provider: "faux", modelId: "faux-1", api: model.api, providerVersion: "review-v1" },
 };
 const registry = createRegistry();
+const agentConfig = { profiles: [profile] };
+const reviewConfig = {
+    profileAllowlist: [profileId],
+    authority: { extensions: [], sections: [], tools: [], capabilities: [] },
+};
 const runtime = createWorkflowAgentRuntime({
     harnessOptions: { models, registry },
-    agentConfig: {
-        profiles: [profile],
-        review: {
-            profileAllowlist: [profileId],
-            authority: { extensions: [], sections: [], tools: [], capabilities: [] },
-        },
-    },
+    agentConfig,
+    admissionPolicy: createWorkflowAgentReviewAdmissionPolicy({
+        models,
+        registry,
+        agentConfig,
+        reviewConfig,
+    }),
 });
 registry.install(runtime.extension);
 const workflow = defineWorkflow({
@@ -111,9 +128,7 @@ const workflow = defineWorkflow({
             turnId: "review-first-turn",
             profile: profileId,
             content: "Review the evidence.",
-            purpose: "review",
-            reviewerIdentity: resolved.identity,
-            freshThread: true,
+            policyBinding: createWorkflowAgentReviewPolicyBinding(resolved.identity, true),
         };
 
         if (scenario === "tampered-first-review") {
@@ -123,7 +138,7 @@ const workflow = defineWorkflow({
                 ...firstTurn,
                 turnId: "review-second-turn",
                 content: "Continue reviewing the evidence.",
-                freshThread: false,
+                policyBinding: createWorkflowAgentReviewPolicyBinding(resolved.identity, false),
             });
         }
 
@@ -145,9 +160,7 @@ if (mode === "tamper") {
             throw new Error("Cannot tamper a missing persisted first Review turn");
         }
 
-        Reflect.deleteProperty(firstTurn, "purpose");
-        Reflect.deleteProperty(firstTurn, "reviewerIdentity");
-        Reflect.deleteProperty(firstTurn, "freshThread");
+        Reflect.deleteProperty(firstTurn, "policyBinding");
     }, context);
 
     await harness.close(context);
@@ -380,9 +393,13 @@ test("reopen replays an exact fresh Review first turn with its persisted identit
                 readonly status: string;
                 readonly turns: readonly {
                     readonly status: string;
-                    readonly purpose?: string;
-                    readonly freshThread?: boolean;
-                    readonly reviewerIdentity?: { readonly fingerprint?: string };
+                    readonly policyBinding?: {
+                        readonly policyId?: string;
+                        readonly input?: {
+                            readonly firstTurn?: boolean;
+                            readonly reviewerIdentity?: { readonly fingerprint?: string };
+                        };
+                    };
                 }[];
             };
         };
@@ -391,9 +408,12 @@ test("reopen replays an exact fresh Review first turn with its persisted identit
         assert.equal(final.thread.status, "ready");
         assert.equal(final.thread.turns.length, 1);
         assert.equal(firstTurn?.status, "completed");
-        assert.equal(firstTurn?.purpose, "review");
-        assert.equal(firstTurn?.freshThread, true);
-        assert.equal(typeof firstTurn?.reviewerIdentity?.fingerprint, "string");
+        assert.equal(firstTurn?.policyBinding?.policyId, "workflow-review");
+        assert.equal(firstTurn?.policyBinding?.input?.firstTurn, true);
+        assert.equal(
+            typeof firstTurn?.policyBinding?.input?.reviewerIdentity?.fingerprint,
+            "string",
+        );
         assert.equal(final.result.content[0]?.text, "recovered Review result");
         assert.deepEqual(await dispatchMarkers(markers), [
             "provider-dispatch",
@@ -444,17 +464,19 @@ test("recovery fences a Review continuation whose first turn lost freshness admi
                 readonly status: string;
                 readonly turns: readonly {
                     readonly status: string;
-                    readonly purpose?: string;
-                    readonly freshThread?: boolean;
+                    readonly policyBinding?: {
+                        readonly policyId?: string;
+                        readonly input?: { readonly firstTurn?: boolean };
+                    };
                 }[];
             };
         };
 
         assert.ok(final.failure);
         assert.equal(final.thread.status, "unknown");
-        assert.equal(final.thread.turns[0]?.purpose, undefined);
-        assert.equal(final.thread.turns[1]?.purpose, "review");
-        assert.equal(final.thread.turns[1]?.freshThread, false);
+        assert.equal(final.thread.turns[0]?.policyBinding, undefined);
+        assert.equal(final.thread.turns[1]?.policyBinding?.policyId, "workflow-review");
+        assert.equal(final.thread.turns[1]?.policyBinding?.input?.firstTurn, false);
         assert.equal(final.thread.turns[1]?.status, "unknown");
         assert.deepEqual(await dispatchMarkers(markers), [
             "provider-dispatch",
@@ -612,7 +634,7 @@ test("reopen may dispatch an exact turn whose intent committed before any native
     }
 });
 
-test("reopen fences a matching runner identity from an unsupported Task version", async () => {
+test("reopen rejects an unsupported runner Task format before scheduling resumes", async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-pocket-agent-version-crash-"));
     const database = join(directory, "agent.sqlite");
     const markers = join(directory, "provider-dispatches.log");
@@ -630,28 +652,13 @@ test("reopen fences a matching runner identity from an unsupported Task version"
         assert.deepEqual(await dispatchMarkers(markers), []);
 
         recovery = startWorker("recover", database, markers);
-        const output = await outputUntil(recovery, "FINAL:");
-
-        await successfulExit(recovery);
-
-        const preopen = payloadAfter(output, "PREOPEN:");
-        const final = payloadAfter(output, "FINAL:");
-        const thread = final.thread as {
-            status: string;
-            turns: { status: string }[];
-        };
-        const runner = final.runner as {
-            version: number;
-            abortRequested?: boolean;
-            state: { status: string; outcome?: { status: string } };
-        };
-
-        assert.equal(preopen.status, "unknown");
-        assert.equal(thread.status, "unknown");
-        assert.equal(thread.turns[0]?.status, "unknown");
-        assert.equal(runner.version, 2);
-        assert.equal(runner.state.status, "terminal");
-        assert.equal(runner.state.outcome?.status, "orphaned");
+        await assert.rejects(
+            outputUntil(recovery, "FINAL:"),
+            /unsupported agent runner format .* recovery remains paused/i,
+        );
+        assert.notEqual(recovery.child.exitCode, null);
+        assert.equal(recovery.child.signalCode, null);
+        assert.match(recovery.errors, /Agent runner Task .* has unsupported agent runner format/i);
         assert.deepEqual(await dispatchMarkers(markers), []);
     } finally {
         await killWorker(first);
@@ -1029,6 +1036,132 @@ test("reopen fences malformed selections with an active safe ToolTask before nat
 
         await rm(directory, { recursive: true, force: true });
     }
+});
+
+test("unsupported agent thread formats are rejected while scheduling is paused", async () => {
+    const mutations: string[] = [];
+    const registeredConversations: number[] = [];
+    const harness = {
+        async inspect() {
+            return { scheduling: "paused", tasks: [] };
+        },
+        async commit() {
+            mutations.push("commit");
+        },
+    } as never;
+    const storage = {
+        async scanDocuments() {
+            return { items: [{ id: 1, key: "legacy-agent-thread" }], next: undefined };
+        },
+        async document() {
+            return { version: 1, value: { schemaVersion: 2, conversationId: 17 } };
+        },
+        async scanTasks() {
+            return { items: [], next: undefined };
+        },
+    } as unknown as Storage;
+
+    await assert.rejects(
+        recoverAgentRunnerTasks(
+            harness,
+            BACKGROUND_CONTEXT,
+            () => true,
+            storage,
+            (conversationId) => registeredConversations.push(conversationId),
+        ),
+        /unsupported agent thread format/i,
+    );
+    assert.deepEqual(mutations, []);
+    assert.deepEqual(registeredConversations, []);
+});
+
+test("unsupported stored agent document versions are rejected before recovery mutation", async () => {
+    const mutations: string[] = [];
+    const registeredConversations: number[] = [];
+    const harness = {
+        async inspect() {
+            return { scheduling: "paused", tasks: [] };
+        },
+        async commit() {
+            mutations.push("commit");
+        },
+    } as never;
+
+    for (const version of [0, 2, undefined]) {
+        const storage = {
+            async scanDocuments() {
+                return { items: [{ id: 1, key: "agent-thread" }], next: undefined };
+            },
+            async document() {
+                return { version, value: { schemaVersion: 1, conversationId: 17 } };
+            },
+            async scanTasks() {
+                return { items: [], next: undefined };
+            },
+        } as unknown as Storage;
+
+        await assert.rejects(
+            recoverAgentRunnerTasks(
+                harness,
+                BACKGROUND_CONTEXT,
+                () => true,
+                storage,
+                (conversationId) => registeredConversations.push(conversationId),
+            ),
+            /unsupported durable agent thread document version/i,
+        );
+    }
+
+    assert.deepEqual(mutations, []);
+    assert.deepEqual(registeredConversations, []);
+});
+
+test("unsupported agent runner formats are rejected before recovery mutates state", async () => {
+    const mutations: string[] = [];
+    const legacyRunner = {
+        id: 7,
+        kind: AGENT_RUNNER_TASK_NAME,
+        version: 2,
+        input: {
+            schemaVersion: 2,
+            runId: "legacy-run",
+            threadId: "legacy-thread",
+            profileId: "legacy-profile",
+            conversationId: 17,
+        },
+        owner: 3,
+        conversationId: 17,
+        abortRequested: false,
+        state: { status: "pending", checkpoint: { phase: "run" } },
+    };
+    const harness = {
+        async inspect() {
+            return { scheduling: "paused", tasks: [{ record: legacyRunner }] };
+        },
+        async commit() {
+            mutations.push("commit");
+        },
+    } as never;
+    const storage = {
+        async scanDocuments() {
+            return { items: [], next: undefined };
+        },
+        async scanTasks() {
+            return { items: [legacyRunner], next: undefined };
+        },
+    } as unknown as Storage;
+
+    await assert.rejects(
+        recoverAgentRunnerTasks(
+            harness,
+            BACKGROUND_CONTEXT,
+            () => true,
+            storage,
+            () => {},
+        ),
+        /unsupported agent runner format/i,
+    );
+    assert.deepEqual(mutations, []);
 });
 
 test("reopen fences a numeric-string submission reference before provider progress", async () => {

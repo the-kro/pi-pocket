@@ -32,6 +32,11 @@ import {
 } from "@earendil-works/pi-durable";
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
 import {
+    type WorkflowAgentAdmissionPolicy,
+    parseWorkflowAgentPolicyBinding,
+    validateWorkflowAgentAdmission,
+} from "./admission-policy.ts";
+import {
     type WorkflowAgentConfig,
     type WorkflowAgentProfile,
     type WorkflowAgentCallAuthority,
@@ -74,11 +79,6 @@ import {
     type WorkflowAgentProfileSnapshot,
     workflowAgentProfileSnapshot,
 } from "./profile-snapshot.ts";
-import {
-    resolveWorkflowAgentReviewProfile,
-    workflowAgentReviewResolutionMatches,
-    workflowAgentReviewThreadAdmissionMatches,
-} from "./review-policy.ts";
 
 function exactPersistedSelection(actual: unknown, expected: readonly string[]): boolean {
     if (
@@ -114,6 +114,7 @@ function workflowAgentRawSelectionMatches(
 export type CreateWorkflowAgentRuntimeOptions<Tool extends ToolRegistration = ToolRegistration> = {
     readonly harnessOptions: HarnessOptions<Tool>;
     readonly agentConfig: WorkflowAgentConfig;
+    readonly admissionPolicy?: WorkflowAgentAdmissionPolicy;
     readonly timerOptions?: WorkflowTimerOptions;
 };
 
@@ -227,6 +228,7 @@ export function createWorkflowAgentRuntime<Tool extends ToolRegistration = ToolR
                 args,
                 api,
                 context,
+                options.admissionPolicy,
             ),
         (conversationId) => workflowAgentConversationIds.has(Number(conversationId)),
     );
@@ -244,6 +246,7 @@ export function createWorkflowAgentRuntime<Tool extends ToolRegistration = ToolR
                 baseRegistry,
                 thread,
                 rawInput,
+                options.admissionPolicy,
             );
 
             if (snapshot === undefined) {
@@ -284,14 +287,17 @@ export function createWorkflowAgentRuntime<Tool extends ToolRegistration = ToolR
         }
     };
 
-    const runnerTask = createWorkflowAgentRunnerTask(baseModels, config, baseRegistry);
-    const resolveReviewProfile = (profileId: string) =>
-        resolveWorkflowAgentReviewProfile(baseModels, config, profileId, baseRegistry);
+    const runnerTask = createWorkflowAgentRunnerTask(
+        baseModels,
+        config,
+        baseRegistry,
+        options.admissionPolicy,
+    );
     const bindAgentTurn = createWorkflowAgentTurnBinder({
         models: baseModels,
         config,
         registry: baseRegistry,
-        resolveReviewProfile,
+        admissionPolicy: options.admissionPolicy,
         runnerTask,
         onConversationAdmitted: (conversationId) =>
             registerWorkflowAgentConversation(Number(conversationId)),
@@ -1011,6 +1017,7 @@ function currentRunnerProfileSnapshot(
     registry: RegistryReader,
     thread: AgentThreadRecord,
     rawInput: JsonValue,
+    admissionPolicy?: WorkflowAgentAdmissionPolicy,
 ): ReturnType<typeof workflowAgentProfileSnapshot> | undefined {
     if (typeof rawInput !== "object" || rawInput === null || Array.isArray(rawInput)) {
         return undefined;
@@ -1052,54 +1059,64 @@ function currentRunnerProfileSnapshot(
         return undefined;
     }
 
-    let reviewIdentityIsCurrent: boolean;
+    let policyBinding: ReturnType<typeof parseWorkflowAgentPolicyBinding> | undefined;
 
-    if (input.purpose === "review") {
-        const resolved = resolveWorkflowAgentReviewProfile(models, config, profile.id, registry);
-
-        reviewIdentityIsCurrent =
-            workflowAgentReviewResolutionMatches(
-                resolved,
-                input.reviewerIdentity,
-                input.effectiveAuthority,
-            ) &&
-            turn.purpose === "review" &&
-            turn.freshThread === input.freshThread &&
-            sameJson(turn.reviewerIdentity, input.reviewerIdentity) &&
-            workflowAgentReviewThreadAdmissionMatches(thread, {
-                turnId: turn.turnId,
-                intentCanonical: turn.intentCanonical,
-                intentDigest: turn.intentDigest,
-                freshThread: turn.freshThread,
-                reviewerIdentity: turn.reviewerIdentity,
-            });
-    } else {
-        reviewIdentityIsCurrent =
-            input.purpose === undefined &&
-            input.reviewerIdentity === undefined &&
-            input.freshThread === undefined &&
-            turn.purpose === undefined &&
-            turn.reviewerIdentity === undefined &&
-            turn.freshThread === undefined;
+    if (input.policyBinding !== undefined) {
+        try {
+            policyBinding = parseWorkflowAgentPolicyBinding(input.policyBinding);
+        } catch {
+            return undefined;
+        }
     }
 
-    const snapshot = workflowAgentProfileSnapshot(
+    if (
+        !sameJson(
+            turn.policyBinding as unknown as JsonValue | undefined,
+            policyBinding as unknown as JsonValue | undefined,
+        )
+    ) {
+        return undefined;
+    }
+
+    const callAuthority: WorkflowAgentCallAuthority = {
+        extensions: effective.extensions.map((entry) => entry.name),
+        sections: effective.sections.map((entry) => entry.key),
+        tools: effective.tools.map((entry) => entry.name),
+        capabilities: effective.capabilities,
+    };
+    const genericSnapshot = workflowAgentProfileSnapshot(
         models,
         config,
         profile,
-        {
-            extensions: effective.extensions.map((entry) => entry.name),
-            sections: effective.sections.map((entry) => entry.key),
-            tools: effective.tools.map((entry) => entry.name),
-            capabilities: effective.capabilities,
-        },
+        callAuthority,
         registry,
     );
+    const policyProfile =
+        policyBinding === undefined ? undefined : admissionPolicy?.resolveProfile?.(profile.id);
+    const snapshot = policyProfile?.snapshot ?? genericSnapshot;
+
+    try {
+        validateWorkflowAgentAdmission(
+            admissionPolicy,
+            "recovery",
+            profile.id,
+            thread,
+            {
+                turnId: turn.turnId,
+                intentCanonical: turn.intentCanonical,
+                intentDigest: turn.intentDigest,
+                ...(policyBinding === undefined ? {} : { policyBinding }),
+            },
+            snapshot,
+        );
+    } catch {
+        return undefined;
+    }
+
     const isCurrent =
         snapshot.profileFingerprint === input.profileFingerprint &&
         snapshot.modelFingerprint === input.modelFingerprint &&
         snapshot.authorityFingerprint === input.authorityFingerprint &&
-        reviewIdentityIsCurrent &&
         snapshot.profileFingerprint === thread.profileFingerprint &&
         snapshot.modelFingerprint === thread.modelFingerprint &&
         snapshot.authorityFingerprint === thread.authorityFingerprint &&
@@ -1480,6 +1497,7 @@ async function assertCurrentAgentToolAuthority(
     _args: unknown,
     api: ToolExecutionApi,
     context: Context,
+    admissionPolicy?: WorkflowAgentAdmissionPolicy,
 ): Promise<ToolExecutionApi> {
     const state = await api.commit(async (tx) => {
         const provider = await tx.doc(ProviderDoc, api.conversationId);
@@ -1598,7 +1616,32 @@ async function assertCurrentAgentToolAuthority(
         tools: effective.tools.map((entry) => entry.name),
         capabilities: effective.capabilities,
     };
-    const snapshot = workflowAgentProfileSnapshot(models, config, profile, callAuthority, registry);
+    const genericSnapshot = workflowAgentProfileSnapshot(
+        models,
+        config,
+        profile,
+        callAuthority,
+        registry,
+    );
+    const policyProfile =
+        turn.policyBinding === undefined
+            ? undefined
+            : admissionPolicy?.resolveProfile?.(profile.id);
+    const snapshot = policyProfile?.snapshot ?? genericSnapshot;
+
+    validateWorkflowAgentAdmission(
+        admissionPolicy,
+        "tool-execution",
+        profile.id,
+        thread,
+        {
+            turnId: turn.turnId,
+            intentCanonical: turn.intentCanonical,
+            intentDigest: turn.intentDigest,
+            ...(turn.policyBinding === undefined ? {} : { policyBinding: turn.policyBinding }),
+        },
+        snapshot,
+    );
 
     if (
         snapshot.profileFingerprint !== thread.profileFingerprint ||

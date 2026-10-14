@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { createModels, fauxAssistantMessage, fauxProvider, Type } from "@earendil-works/pi-ai";
+import { fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import {
     AssistantEntry,
     createRegistry,
+    defineExtension,
+    defineTool,
     MemoryStorage,
     ProviderDoc,
     type ConversationId,
@@ -26,7 +29,12 @@ import { defineWorkflow, type WorkflowContext } from "../packages/workflow-runti
 
 const context = BACKGROUND_CONTEXT;
 
-function agentFixture(profileIds = ["turn-test"], settings?: HarnessOptions["settings"]) {
+function agentFixture(
+    profileIds = ["turn-test"],
+    settings?: HarnessOptions["settings"],
+    admissionPolicy?: unknown,
+    installRuntime = true,
+) {
     const registry = createRegistry();
     const models = createModels();
     const faux = fauxProvider();
@@ -47,15 +55,285 @@ function agentFixture(profileIds = ["turn-test"], settings?: HarnessOptions["set
         },
     }));
     const profile = profiles[0]!;
-    const runtime = createWorkflowAgentRuntime({
+    const runtimeOptions = {
         harnessOptions: { models, registry, ...(settings === undefined ? {} : { settings }) },
         agentConfig: { profiles },
-    });
+        ...(admissionPolicy === undefined ? {} : { admissionPolicy }),
+    } as Parameters<typeof createWorkflowAgentRuntime>[0];
+    const runtime = createWorkflowAgentRuntime(runtimeOptions);
 
-    registry.install(runtime.extension);
+    if (installRuntime) {
+        registry.install(runtime.extension);
+    }
 
     return { registry, models, faux, profile, profiles, runtime };
 }
+
+test("generic admission policy validates a bound turn at reservation and dispatch", async () => {
+    const phases: string[] = [];
+    const policyBinding = {
+        policyId: "test-admission",
+        policyVersion: "1",
+        input: { purpose: "bounded-test" },
+    };
+    const admissionPolicy = {
+        validate(input: {
+            readonly stage: string;
+            readonly binding: typeof policyBinding;
+            readonly thread: unknown;
+            readonly turn: { readonly turnId: string };
+        }) {
+            assert.equal(input.binding.policyId, "test-admission");
+            assert.equal(input.turn.turnId, "policy-turn");
+            assert.ok(input.thread);
+            phases.push(input.stage);
+        },
+    };
+    const { faux, profile, runtime } = agentFixture(["policy-test"], undefined, admissionPolicy);
+
+    faux.setResponses([fauxAssistantMessage("admitted")]);
+    const host = await runtime.openHost(new MemoryStorage(), context, () => undefined);
+    const workflow = defineWorkflow({
+        id: "generic-agent-admission-policy",
+        version: 1,
+        async run({ agent }: WorkflowContext<null>) {
+            assert.ok(agent);
+
+            return agent.turn({
+                threadId: "policy-thread",
+                turnId: "policy-turn",
+                profile: profile.id,
+                content: "Run the generic policy check.",
+                policyBinding,
+            });
+        },
+    });
+
+    try {
+        runtime.engine.register(workflow);
+        await runtime.engine.start(workflow, null, { runId: "generic-policy-run" }, context);
+        await runtime.engine.wait("generic-policy-run", context);
+
+        assert.deepEqual(phases, ["reservation", "dispatch"]);
+    } finally {
+        await host.dispose();
+        await runtime.close();
+        await host.harness.close(context);
+    }
+});
+
+test("runner rejects an unsupported agent thread version before provider dispatch", async () => {
+    const providerDispatches: string[] = [];
+    let releaseRunner!: () => void;
+    let markRunnerStarted!: () => void;
+    const runnerGate = new Promise<void>((resolve) => {
+        releaseRunner = resolve;
+    });
+    const runnerStarted = new Promise<void>((resolve) => {
+        markRunnerStarted = resolve;
+    });
+    const { registry, faux, profile, runtime } = agentFixture(
+        ["thread-version-policy"],
+        undefined,
+        undefined,
+        false,
+    );
+    const runtimeTasks = runtime.extension.tasks;
+
+    assert.ok(runtimeTasks);
+    const runnerTask = runtimeTasks.find((task) => task.definition.name === AGENT_RUNNER_TASK_NAME);
+
+    assert.ok(runnerTask);
+    const runPhase = runnerTask.definition.phases.run as (...args: unknown[]) => unknown;
+    const gatedRunnerTask = {
+        ...runnerTask,
+        definition: {
+            ...runnerTask.definition,
+            phases: {
+                ...runnerTask.definition.phases,
+                run: async (...args: unknown[]) => {
+                    markRunnerStarted();
+                    await runnerGate;
+
+                    return runPhase(...args);
+                },
+            },
+        },
+    };
+
+    registry.install(
+        defineExtension({
+            ...runtime.extension,
+            tasks: runtimeTasks.map((task) =>
+                task.definition.name === AGENT_RUNNER_TASK_NAME ? gatedRunnerTask : task,
+            ),
+        }),
+    );
+    faux.setResponses([
+        async () => {
+            providerDispatches.push("dispatched");
+
+            return fauxAssistantMessage("This provider response must remain unused.");
+        },
+    ]);
+    const host = await runtime.openHost(new MemoryStorage(), context, () => undefined);
+    const runId = "agent-thread-version-policy-run";
+    const threadId = "agent-thread-version-policy-thread";
+    const threadKey = workflowAgentThreadKey({ runId, threadId, profileId: profile.id });
+    const workflow = defineWorkflow({
+        id: "agent-thread-version-policy",
+        version: 1,
+        async run({ agent }: WorkflowContext<null>) {
+            assert.ok(agent);
+
+            return agent.turn({
+                threadId,
+                turnId: "version-policy-turn",
+                profile: profile.id,
+                content: "Reject the changed persisted thread version.",
+            });
+        },
+    });
+
+    try {
+        runtime.engine.register(workflow);
+        await runtime.engine.start(workflow, null, { runId }, context);
+        await runnerStarted;
+
+        const reservedThread = await host.harness.snapshot(AGENT_THREAD_DOC, threadKey, context);
+
+        assert.equal(reservedThread?.schemaVersion, 1);
+        assert.equal(reservedThread?.turns?.[0]?.status, "reserved");
+        await host.harness.commit(async (tx) => {
+            const thread = await tx.doc(AGENT_THREAD_DOC, threadKey, threadKey);
+
+            Object.assign(thread, { schemaVersion: 2 });
+        }, context);
+        releaseRunner();
+        await assert.rejects(runtime.engine.wait(runId, context));
+
+        const thread = await host.harness.snapshot(AGENT_THREAD_DOC, threadKey, context);
+
+        assert.equal(thread?.schemaVersion, 2);
+        assert.deepEqual(providerDispatches, []);
+    } finally {
+        releaseRunner();
+        await host.dispose();
+        await runtime.close();
+        await host.harness.close(context);
+    }
+});
+
+test("generic admission policy is revalidated before native tool execution", async () => {
+    const phases: string[] = [];
+    const toolExecutions: string[] = [];
+    const registry = createRegistry();
+    const models = createModels();
+    const faux = fauxProvider();
+
+    models.setProvider(faux.provider);
+    const model = models.getModel("faux", "faux-1")!;
+    const extension = defineExtension({
+        name: "policy-tool-extension",
+        tools: [
+            defineTool({
+                name: "policy_read",
+                description: "Read the policy fixture.",
+                parameters: Type.Object({}),
+                async execute() {
+                    toolExecutions.push("executed");
+
+                    return { content: [{ type: "text", text: "fixture" }] };
+                },
+            }),
+        ],
+    });
+
+    registry.install(extension);
+    const profile = {
+        id: "policy-tool-profile",
+        version: 1,
+        instructions: "Read the fixture.",
+        instructionsVersion: "1",
+        model: {
+            provider: "faux",
+            modelId: "faux-1",
+            api: model.api,
+            providerVersion: "faux-test-v1",
+        },
+        extensions: [{ name: extension.name, version: "1" }],
+        sections: [],
+        tools: [
+            {
+                name: "policy_read",
+                extension: extension.name,
+                version: "1",
+                capabilities: ["filesystem.read"],
+            },
+        ],
+        capabilities: ["filesystem.read"],
+    };
+    const authority = {
+        extensions: [extension.name],
+        sections: [],
+        tools: ["policy_read"],
+        capabilities: ["filesystem.read"],
+    };
+    const runtime = createWorkflowAgentRuntime({
+        harnessOptions: { models, registry },
+        agentConfig: { authority, profiles: [profile] },
+        admissionPolicy: {
+            validate({ stage }) {
+                phases.push(stage);
+
+                if (stage === "tool-execution") {
+                    throw new Error("policy expired before tool execution");
+                }
+            },
+        },
+    });
+
+    registry.install(runtime.extension);
+    faux.setResponses([
+        fauxAssistantMessage([fauxToolCall("policy_read", {}, { id: "policy-read" })], {
+            stopReason: "toolUse",
+        }),
+        fauxAssistantMessage("The tool must not run."),
+    ]);
+    const host = await runtime.openHost(new MemoryStorage(), context, () => undefined);
+    const workflow = defineWorkflow({
+        id: "generic-tool-admission-policy",
+        version: 1,
+        async run({ agent }: WorkflowContext<null>) {
+            assert.ok(agent);
+
+            return agent.turn({
+                threadId: "policy-tool-thread",
+                turnId: "policy-tool-turn",
+                profile: profile.id,
+                content: "Read the fixture.",
+                policyBinding: {
+                    policyId: "test-admission",
+                    policyVersion: "1",
+                    input: { purpose: "tool-check" },
+                },
+            });
+        },
+    });
+
+    try {
+        runtime.engine.register(workflow);
+        await runtime.engine.start(workflow, null, { runId: "generic-tool-policy-run" }, context);
+        await runtime.engine.wait("generic-tool-policy-run", context);
+
+        assert.deepEqual(phases, ["reservation", "dispatch", "tool-execution"]);
+        assert.deepEqual(toolExecutions, []);
+    } finally {
+        await host.dispose();
+        await runtime.close();
+        await host.harness.close(context);
+    }
+});
 
 test("durable model identity excludes credentials and retains public route identity", () => {
     const { models } = agentFixture();

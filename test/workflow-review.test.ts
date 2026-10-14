@@ -13,10 +13,8 @@ import {
     MemoryStorage,
     section,
 } from "@earendil-works/pi-durable";
-import {
-    workflowAgentResultSchemaFingerprint,
-    type WorkflowAgentReviewProfileDescriptor,
-} from "../packages/workflow-runtime/agents/profile.ts";
+import { workflowAgentResultSchemaFingerprint } from "../packages/workflow-runtime/agents/profile.ts";
+import type { WorkflowAgentReviewProfileDescriptor } from "../packages/workflow-runtime/review/agent-policy.ts";
 import { defineWorkflow, type WorkflowContext } from "../packages/workflow-runtime/core/index.ts";
 
 const reviewApi = await import("../packages/workflow-runtime/review/contract.ts").catch(
@@ -711,13 +709,17 @@ test("Review uses a separate schema-bound read-only reviewer and promotes only f
         ...reviewResponses("review-first", firstDecision),
         ...reviewResponses("review-second", secondDecision),
     ]);
+    const agentConfig = { authority, profiles: [reviewerProfile, implementerProfile] };
+    const reviewConfig = { profileAllowlist: [reviewerProfile.id], authority };
     const runtime = workflowRuntime.createWorkflowAgentRuntime({
         harnessOptions: { models, registry },
-        agentConfig: {
-            authority,
-            profiles: [reviewerProfile, implementerProfile],
-            review: { profileAllowlist: [reviewerProfile.id], authority },
-        },
+        agentConfig,
+        admissionPolicy: workflowRuntime.createWorkflowAgentReviewAdmissionPolicy({
+            models,
+            registry,
+            agentConfig,
+            reviewConfig,
+        }),
     });
 
     registry.install(runtime.extension);
@@ -799,27 +801,29 @@ test("Review uses a separate schema-bound read-only reviewer and promotes only f
                 (turn: {
                     turnId: string;
                     status: string;
-                    purpose?: string;
-                    freshThread?: boolean;
+                    policyBinding?: {
+                        readonly policyId?: string;
+                        readonly input?: { readonly firstTurn?: boolean };
+                    };
                 }) => ({
                     turnId: turn.turnId,
                     status: turn.status,
-                    purpose: turn.purpose,
-                    freshThread: turn.freshThread,
+                    policyId: turn.policyBinding?.policyId,
+                    firstTurn: turn.policyBinding?.input?.firstTurn,
                 }),
             ),
             [
                 {
                     turnId: reviewRequest.turnId,
                     status: "completed",
-                    purpose: "review",
-                    freshThread: true,
+                    policyId: workflowRuntime.WORKFLOW_AGENT_REVIEW_POLICY_ID,
+                    firstTurn: true,
                 },
                 {
                     turnId: "reviewer-turn-direct-2",
                     status: "completed",
-                    purpose: "review",
-                    freshThread: false,
+                    policyId: workflowRuntime.WORKFLOW_AGENT_REVIEW_POLICY_ID,
+                    firstTurn: false,
                 },
             ],
         );
@@ -1043,20 +1047,36 @@ test("Review binds runtime identity and fresh-thread admission to gate turns", a
     assert.deepEqual(
         turnInputs.map((input) => {
             const turn = input as {
-                readonly purpose?: string;
-                readonly reviewerIdentity?: unknown;
-                readonly freshThread?: boolean;
+                readonly policyBinding?: {
+                    readonly policyId?: string;
+                    readonly policyVersion?: string;
+                    readonly input?: {
+                        readonly reviewerIdentity?: unknown;
+                        readonly firstTurn?: boolean;
+                    };
+                };
             };
 
             return {
-                purpose: turn.purpose,
-                reviewerIdentity: turn.reviewerIdentity,
-                freshThread: turn.freshThread,
+                policyId: turn.policyBinding?.policyId,
+                policyVersion: turn.policyBinding?.policyVersion,
+                reviewerIdentity: turn.policyBinding?.input?.reviewerIdentity,
+                firstTurn: turn.policyBinding?.input?.firstTurn,
             };
         }),
         [
-            { purpose: "review", reviewerIdentity: resolvedIdentity, freshThread: true },
-            { purpose: "review", reviewerIdentity: resolvedIdentity, freshThread: false },
+            {
+                policyId: workflowRuntime.WORKFLOW_AGENT_REVIEW_POLICY_ID,
+                policyVersion: "1",
+                reviewerIdentity: resolvedIdentity,
+                firstTurn: true,
+            },
+            {
+                policyId: workflowRuntime.WORKFLOW_AGENT_REVIEW_POLICY_ID,
+                policyVersion: "1",
+                reviewerIdentity: resolvedIdentity,
+                firstTurn: false,
+            },
         ],
     );
 });

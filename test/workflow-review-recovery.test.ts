@@ -414,8 +414,10 @@ test("cold recovery rejects revision A and requires fresh Verify and Review on r
                 readonly turns: readonly {
                     readonly turnId: string;
                     readonly status: string;
-                    readonly purpose?: string;
-                    readonly freshThread?: boolean;
+                    readonly policyBinding?: {
+                        readonly policyId?: string;
+                        readonly input: { readonly firstTurn?: boolean };
+                    };
                 }[];
             };
         }>(recoveredOutput, "FINAL:");
@@ -440,21 +442,21 @@ test("cold recovery rejects revision A and requires fresh Verify and Review on r
             recovered.thread.turns.map((turn) => ({
                 turnId: turn.turnId,
                 status: turn.status,
-                purpose: turn.purpose,
-                freshThread: turn.freshThread,
+                policyId: turn.policyBinding?.policyId,
+                firstTurn: turn.policyBinding?.input.firstTurn,
             })),
             [
                 {
                     turnId: "review-turn-cold-recovery",
                     status: "completed",
-                    purpose: "review",
-                    freshThread: true,
+                    policyId: "workflow-review",
+                    firstTurn: true,
                 },
                 {
                     turnId: "review-turn-cold-recovery-2",
                     status: "completed",
-                    purpose: "review",
-                    freshThread: false,
+                    policyId: "workflow-review",
+                    firstTurn: false,
                 },
             ],
         );
@@ -542,8 +544,10 @@ test("a repaired Review pass resumes on the same conversation with a fresh turn"
                 readonly turns: readonly {
                     readonly turnId: string;
                     readonly status: string;
-                    readonly purpose?: string;
-                    readonly freshThread?: boolean;
+                    readonly policyBinding?: {
+                        readonly policyId?: string;
+                        readonly input: { readonly firstTurn?: boolean };
+                    };
                 }[];
             };
         }>(recoveredOutput, "FINAL:");
@@ -571,21 +575,21 @@ test("a repaired Review pass resumes on the same conversation with a fresh turn"
             recovered.thread.turns.map((turn) => ({
                 turnId: turn.turnId,
                 status: turn.status,
-                purpose: turn.purpose,
-                freshThread: turn.freshThread,
+                policyId: turn.policyBinding?.policyId,
+                firstTurn: turn.policyBinding?.input.firstTurn,
             })),
             [
                 {
                     turnId: "review-turn-cold-recovery",
                     status: "completed",
-                    purpose: "review",
-                    freshThread: true,
+                    policyId: "workflow-review",
+                    firstTurn: true,
                 },
                 {
                     turnId: "review-turn-cold-recovery-2",
                     status: "completed",
-                    purpose: "review",
-                    freshThread: false,
+                    policyId: "workflow-review",
+                    firstTurn: false,
                 },
             ],
         );
@@ -748,8 +752,10 @@ test("BLOCKED review parks durably and consumes exact guidance once after reopen
                 readonly turns: readonly {
                     readonly turnId: string;
                     readonly status: string;
-                    readonly purpose?: string;
-                    readonly freshThread?: boolean;
+                    readonly policyBinding?: {
+                        readonly policyId?: string;
+                        readonly input: { readonly firstTurn?: boolean };
+                    };
                 }[];
             };
         }>(finalOutput, "FINAL:");
@@ -774,21 +780,21 @@ test("BLOCKED review parks durably and consumes exact guidance once after reopen
             final.thread.turns.map((turn) => ({
                 turnId: turn.turnId,
                 status: turn.status,
-                purpose: turn.purpose,
-                freshThread: turn.freshThread,
+                policyId: turn.policyBinding?.policyId,
+                firstTurn: turn.policyBinding?.input.firstTurn,
             })),
             [
                 {
                     turnId: "review-turn-cold-recovery",
                     status: "completed",
-                    purpose: "review",
-                    freshThread: true,
+                    policyId: "workflow-review",
+                    firstTurn: true,
                 },
                 {
                     turnId: "review-turn-cold-recovery-2",
                     status: "completed",
-                    purpose: "review",
-                    freshThread: false,
+                    policyId: "workflow-review",
+                    firstTurn: false,
                 },
             ],
         );

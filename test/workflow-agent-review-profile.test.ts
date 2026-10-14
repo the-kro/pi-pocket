@@ -10,9 +10,13 @@ import {
 } from "@earendil-works/pi-durable";
 import {
     AGENT_THREAD_DOC,
+    createWorkflowAgentReviewAdmissionPolicy,
+    createWorkflowAgentReviewPolicyBinding,
     createWorkflowAgentRuntime,
+    WORKFLOW_AGENT_REVIEW_POLICY_ID,
     workflowAgentThreadKey,
     type WorkflowAgentConfig,
+    type WorkflowAgentReviewConfig,
     type WorkflowAgentReviewProfileDescriptor,
 } from "../packages/workflow-runtime/index.ts";
 import { fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -27,6 +31,24 @@ async function resolvedReviewProfile(
     return (await agent.resolveProfile(
         profileId,
     )) as unknown as WorkflowAgentReviewProfileDescriptor;
+}
+
+function createReviewRuntime(
+    models: ReturnType<typeof createModels>,
+    registry: ReturnType<typeof createRegistry>,
+    agentConfig: WorkflowAgentConfig,
+    reviewConfig: WorkflowAgentReviewConfig,
+) {
+    return createWorkflowAgentRuntime({
+        harnessOptions: { models, registry },
+        agentConfig,
+        admissionPolicy: createWorkflowAgentReviewAdmissionPolicy({
+            models,
+            registry,
+            agentConfig,
+            reviewConfig,
+        }),
+    });
 }
 
 test("runtime resolves the allowlisted Review identity used by fresh-thread admission", async () => {
@@ -63,16 +85,20 @@ test("runtime resolves the allowlisted Review identity used by fresh-thread admi
             },
         },
     };
-    const agentConfig: WorkflowAgentConfig = {
-        profiles: [profile, schemaProfile],
-        review: {
-            profileAllowlist: [profile.id, schemaProfile.id],
-            authority: { extensions: [], sections: [], tools: [], capabilities: [] },
-        },
+    const agentConfig: WorkflowAgentConfig = { profiles: [profile, schemaProfile] };
+    const reviewConfig = {
+        profileAllowlist: [profile.id, schemaProfile.id],
+        authority: { extensions: [], sections: [], tools: [], capabilities: [] },
     };
     const runtime = createWorkflowAgentRuntime({
         harnessOptions: { models, registry },
         agentConfig,
+        admissionPolicy: createWorkflowAgentReviewAdmissionPolicy({
+            models,
+            registry,
+            agentConfig,
+            reviewConfig,
+        }),
     });
 
     registry.install(runtime.extension);
@@ -111,9 +137,7 @@ test("runtime resolves the allowlisted Review identity used by fresh-thread admi
                 turnId: "review-first-turn",
                 profile: profile.id,
                 content: "Review this evidence.",
-                purpose: "review",
-                reviewerIdentity: resolved.identity,
-                freshThread: true,
+                policyBinding: createWorkflowAgentReviewPolicyBinding(resolved.identity, true),
             });
 
             return { result, identity: resolved.identity };
@@ -137,9 +161,20 @@ test("runtime resolves the allowlisted Review identity used by fresh-thread admi
         };
 
         assert.equal(workflowResult.result.content[0]?.text, "review answer");
-        assert.equal(thread?.turns?.[0]?.purpose, "review");
-        assert.equal(thread?.turns?.[0]?.freshThread, true);
-        assert.deepEqual(thread?.turns?.[0]?.reviewerIdentity, workflowResult.identity);
+        assert.equal(thread?.turns?.[0]?.policyBinding?.policyId, WORKFLOW_AGENT_REVIEW_POLICY_ID);
+        assert.equal(
+            (thread?.turns?.[0]?.policyBinding?.input as { readonly firstTurn?: unknown })
+                .firstTurn,
+            true,
+        );
+        assert.deepEqual(
+            (thread?.turns?.[0]?.policyBinding?.input as { readonly reviewerIdentity?: unknown })
+                .reviewerIdentity,
+            workflowResult.identity,
+        );
+        assert.equal("purpose" in thread!.turns![0]!, false);
+        assert.equal("freshThread" in thread!.turns![0]!, false);
+        assert.equal("reviewerIdentity" in thread!.turns![0]!, false);
         assert.equal(faux.state.callCount, 1);
     } finally {
         await host.dispose();
@@ -168,16 +203,15 @@ test("fresh Review admission rejects a pre-used thread atomically", async () => 
             providerVersion: "faux-review-v1",
         },
     };
-    const runtime = createWorkflowAgentRuntime({
-        harnessOptions: { models, registry },
-        agentConfig: {
-            profiles: [profile],
-            review: {
-                profileAllowlist: [profile.id],
-                authority: { extensions: [], sections: [], tools: [], capabilities: [] },
-            },
+    const runtime = createReviewRuntime(
+        models,
+        registry,
+        { profiles: [profile] },
+        {
+            profileAllowlist: [profile.id],
+            authority: { extensions: [], sections: [], tools: [], capabilities: [] },
         },
-    });
+    );
 
     registry.install(runtime.extension);
     const host = await runtime.openHost(new MemoryStorage(), context, () => undefined);
@@ -199,9 +233,7 @@ test("fresh Review admission rejects a pre-used thread atomically", async () => 
                 turnId: "review-first-turn",
                 profile: profile.id,
                 content: "Require a fresh reviewer conversation.",
-                purpose: "review",
-                reviewerIdentity: resolved.identity,
-                freshThread: true,
+                policyBinding: createWorkflowAgentReviewPolicyBinding(resolved.identity, true),
             });
         },
     });
@@ -263,16 +295,15 @@ test("Review turns require fresh-thread admission for new and pre-used threads",
             providerVersion: "faux-review-v1",
         },
     };
-    const runtime = createWorkflowAgentRuntime({
-        harnessOptions: { models, registry },
-        agentConfig: {
-            profiles: [profile],
-            review: {
-                profileAllowlist: [profile.id],
-                authority: { extensions: [], sections: [], tools: [], capabilities: [] },
-            },
+    const runtime = createReviewRuntime(
+        models,
+        registry,
+        { profiles: [profile] },
+        {
+            profileAllowlist: [profile.id],
+            authority: { extensions: [], sections: [], tools: [], capabilities: [] },
         },
-    });
+    );
 
     registry.install(runtime.extension);
     const host = await runtime.openHost(new MemoryStorage(), context, () => undefined);
@@ -305,11 +336,17 @@ test("Review turns require fresh-thread admission for new and pre-used threads",
                     turnId: `review-turn-${index}`,
                     profile: profile.id,
                     content: "Start or continue a Review without fresh-thread admission.",
-                    purpose: "review",
-                    reviewerIdentity: resolved.identity,
-                    ...(scenario.freshThread === undefined
-                        ? {}
-                        : { freshThread: scenario.freshThread }),
+                    policyBinding:
+                        scenario.freshThread === undefined
+                            ? {
+                                  policyId: WORKFLOW_AGENT_REVIEW_POLICY_ID,
+                                  policyVersion: "1",
+                                  input: { reviewerIdentity: resolved.identity },
+                              }
+                            : createWorkflowAgentReviewPolicyBinding(
+                                  resolved.identity,
+                                  scenario.freshThread,
+                              ),
                 };
 
                 try {
@@ -392,16 +429,15 @@ test("the exact first Review turn replays and later Review turns continue its th
             providerVersion: "faux-review-v1",
         },
     };
-    const runtime = createWorkflowAgentRuntime({
-        harnessOptions: { models, registry },
-        agentConfig: {
-            profiles: [profile],
-            review: {
-                profileAllowlist: [profile.id],
-                authority: { extensions: [], sections: [], tools: [], capabilities: [] },
-            },
+    const runtime = createReviewRuntime(
+        models,
+        registry,
+        { profiles: [profile] },
+        {
+            profileAllowlist: [profile.id],
+            authority: { extensions: [], sections: [], tools: [], capabilities: [] },
         },
-    });
+    );
 
     registry.install(runtime.extension);
     const host = await runtime.openHost(new MemoryStorage(), context, () => undefined);
@@ -416,16 +452,14 @@ test("the exact first Review turn replays and later Review turns continue its th
                 turnId: "review-turn-one",
                 profile: profile.id,
                 content: "First review pass.",
-                purpose: "review",
-                reviewerIdentity: resolved.identity,
-                freshThread: true,
+                policyBinding: createWorkflowAgentReviewPolicyBinding(resolved.identity, true),
             } as const;
             const first = await agent.turn(firstRequest);
             const second = await agent.turn({
                 ...firstRequest,
                 turnId: "review-turn-two",
                 content: "Continue the same review conversation.",
-                freshThread: false,
+                policyBinding: createWorkflowAgentReviewPolicyBinding(resolved.identity, false),
             });
             const replay = await agent.turn(firstRequest);
 
@@ -454,10 +488,20 @@ test("the exact first Review turn replays and later Review turns continue its th
         assert.deepEqual(result.first, result.replay);
         assert.equal(result.second.content[0]?.text, "second review");
         assert.equal(thread?.turns?.length, 2);
-        assert.equal(thread?.turns?.[0]?.freshThread, true);
-        assert.equal(thread?.turns?.[1]?.freshThread, false);
         assert.equal(
-            thread?.turns?.every((turn) => turn.purpose === "review"),
+            (thread?.turns?.[0]?.policyBinding?.input as { readonly firstTurn?: unknown })
+                .firstTurn,
+            true,
+        );
+        assert.equal(
+            (thread?.turns?.[1]?.policyBinding?.input as { readonly firstTurn?: unknown })
+                .firstTurn,
+            false,
+        );
+        assert.equal(
+            thread?.turns?.every(
+                (turn) => turn.policyBinding?.policyId === WORKFLOW_AGENT_REVIEW_POLICY_ID,
+            ),
             true,
         );
         assert.equal(faux.state.callCount, 2);
@@ -560,25 +604,26 @@ test("Review authority excludes a mutation-capable profile and guards nested eff
         ],
         capabilities: ["filesystem.read", "filesystem.write"],
     };
-    const runtime = createWorkflowAgentRuntime({
-        harnessOptions: { models, registry },
-        agentConfig: {
+    const runtime = createReviewRuntime(
+        models,
+        registry,
+        {
             profiles: [profile],
             authority: {
                 extensions: [readExtension.name, mutationExtension.name],
                 tools: ["review-read", "review-write"],
                 capabilities: ["filesystem.read", "filesystem.write"],
             },
-            review: {
-                profileAllowlist: [profile.id],
-                authority: {
-                    extensions: [readExtension.name],
-                    tools: ["review-read"],
-                    capabilities: ["filesystem.read"],
-                },
+        },
+        {
+            profileAllowlist: [profile.id],
+            authority: {
+                extensions: [readExtension.name],
+                tools: ["review-read"],
+                capabilities: ["filesystem.read"],
             },
         },
-    });
+    );
 
     registry.install(runtime.extension);
     faux.setResponses([
@@ -609,9 +654,7 @@ test("Review authority excludes a mutation-capable profile and guards nested eff
                 turnId: "review-read-only-turn",
                 profile: profile.id,
                 content: "Read only.",
-                purpose: "review",
-                reviewerIdentity: resolved.identity,
-                freshThread: true,
+                policyBinding: createWorkflowAgentReviewPolicyBinding(resolved.identity, true),
             });
         },
     });
@@ -679,17 +722,18 @@ test("registry drift between Review resolution and admission rejects before thre
         ],
         capabilities: [],
     };
-    const runtime = createWorkflowAgentRuntime({
-        harnessOptions: { models, registry },
-        agentConfig: {
+    const runtime = createReviewRuntime(
+        models,
+        registry,
+        {
             profiles: [profile],
             authority: { extensions: [extensionName], tools: ["review-drift-read"] },
-            review: {
-                profileAllowlist: [profile.id],
-                authority: { extensions: [extensionName], tools: ["review-drift-read"] },
-            },
         },
-    });
+        {
+            profileAllowlist: [profile.id],
+            authority: { extensions: [extensionName], tools: ["review-drift-read"] },
+        },
+    );
 
     registry.install(runtime.extension);
     const host = await runtime.openHost(new MemoryStorage(), context, () => undefined);
@@ -721,9 +765,7 @@ test("registry drift between Review resolution and admission rejects before thre
                 turnId: "review-drift-turn",
                 profile: profile.id,
                 content: "Do not admit after registry drift.",
-                purpose: "review",
-                reviewerIdentity: resolved.identity,
-                freshThread: true,
+                policyBinding: createWorkflowAgentReviewPolicyBinding(resolved.identity, true),
             });
         },
     });
@@ -778,16 +820,15 @@ test("forged identities and profiles outside the Review allowlist fail before ad
     });
     const allowedProfile = profile("allowlisted-reviewer");
     const excludedProfile = profile("excluded-reviewer");
-    const runtime = createWorkflowAgentRuntime({
-        harnessOptions: { models, registry },
-        agentConfig: {
-            profiles: [allowedProfile, excludedProfile],
-            review: {
-                profileAllowlist: [allowedProfile.id],
-                authority: { extensions: [], sections: [], tools: [], capabilities: [] },
-            },
+    const runtime = createReviewRuntime(
+        models,
+        registry,
+        { profiles: [allowedProfile, excludedProfile] },
+        {
+            profileAllowlist: [allowedProfile.id],
+            authority: { extensions: [], sections: [], tools: [], capabilities: [] },
         },
-    });
+    );
 
     registry.install(runtime.extension);
     const host = await runtime.openHost(new MemoryStorage(), context, () => undefined);
@@ -807,9 +848,10 @@ test("forged identities and profiles outside the Review allowlist fail before ad
                 turnId: "forged-review-turn",
                 profile: allowedProfile.id,
                 content: "Do not admit this forged identity.",
-                purpose: "review",
-                reviewerIdentity: { ...resolved.identity, fingerprint: "forged" },
-                freshThread: true,
+                policyBinding: createWorkflowAgentReviewPolicyBinding(
+                    { ...resolved.identity, fingerprint: "forged" },
+                    true,
+                ),
             });
         },
     });

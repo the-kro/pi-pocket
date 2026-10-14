@@ -761,7 +761,7 @@ test("preflight durably classifies uncertain runner work before abort marking", 
     let abortObservedStatus = "not-run";
     let threadKey = "";
     const runner = defineTask<
-        { runId: string; threadId: string; profileId: string },
+        { schemaVersion: 1; runId: string; threadId: string; profileId: string },
         { phase: "dispatching" },
         string
     >({
@@ -833,7 +833,12 @@ test("preflight durably classifies uncertain runner work before abort marking", 
         .root(BACKGROUND_CONTEXT)
         .then((root) =>
             root.commit(
-                (tx) => tx.createTask(runner, identity, { ownership: { kind: "conversation" } }),
+                (tx) =>
+                    tx.createTask(
+                        runner,
+                        { schemaVersion: 1, ...identity },
+                        { ownership: { kind: "conversation" } },
+                    ),
                 BACKGROUND_CONTEXT,
             ),
         );

@@ -95,34 +95,9 @@ export type EffectiveWorkflowAgentAuthority = {
     readonly capabilities: readonly string[];
 };
 
-export type WorkflowAgentReviewIdentity = {
-    readonly profileId: string;
-    readonly profileFingerprint: string;
-    readonly modelFingerprint: string;
-    readonly authorityFingerprint: string;
-    readonly policyFingerprint: string;
-    readonly resultSchemaFingerprint: string | null;
-    readonly fingerprint: string;
-};
-
-export type WorkflowAgentReviewProfileDescriptor = {
-    readonly profile: { readonly id: string; readonly version: number };
-    readonly instructions: { readonly text: string; readonly version: string };
-    readonly model: WorkflowAgentModelRoute & { readonly fingerprint: string };
-    readonly authority: EffectiveWorkflowAgentAuthority;
-    readonly result?: WorkflowAgentResultBinding & { readonly fingerprint: string };
-    readonly identity: WorkflowAgentReviewIdentity;
-};
-
-export type WorkflowAgentReviewConfig = {
-    readonly profileAllowlist: readonly string[];
-    readonly authority: WorkflowAgentAuthorityFloor;
-};
-
 export type WorkflowAgentConfig = {
     readonly profiles: readonly WorkflowAgentProfile[];
     readonly authority?: WorkflowAgentAuthorityFloor;
-    readonly review?: WorkflowAgentReviewConfig;
     readonly buildEnv?: (
         profile: WorkflowAgentProfile,
         target: EnvTarget,
@@ -141,10 +116,6 @@ export type ResolvedWorkflowAgentConfig = {
     readonly profiles: readonly WorkflowAgentProfile[];
     readonly byId: ReadonlyMap<string, WorkflowAgentProfile>;
     readonly authority: Required<WorkflowAgentAuthorityFloor>;
-    readonly review?: {
-        readonly profileAllowlist: readonly string[];
-        readonly authority: Required<WorkflowAgentAuthorityFloor>;
-    };
     readonly buildEnv?: WorkflowAgentConfig["buildEnv"];
 };
 
@@ -206,64 +177,12 @@ export function resolveWorkflowAgentConfig(
         byId.set(profile.id, profile);
     }
 
-    let review: ResolvedWorkflowAgentConfig["review"];
-
-    if (config.review !== undefined) {
-        const profileAllowlist = [...config.review.profileAllowlist];
-        const reviewAuthority = {
-            extensions: [...(config.review.authority.extensions ?? [])],
-            sections: [...(config.review.authority.sections ?? [])],
-            tools: [...(config.review.authority.tools ?? [])],
-            capabilities: [...(config.review.authority.capabilities ?? [])],
-        };
-
-        if (
-            profileAllowlist.length === 0 ||
-            profileAllowlist.some(
-                (profileId) => typeof profileId !== "string" || profileId.length === 0,
-            ) ||
-            new Set(profileAllowlist).size !== profileAllowlist.length
-        ) {
-            throw new TypeError(
-                "Review profile allowlist must contain unique non-empty profile IDs",
-            );
-        }
-
-        for (const profileId of profileAllowlist) {
-            if (!byId.has(profileId)) {
-                throw new TypeError(`Review profile ${profileId} is not configured`);
-            }
-        }
-
-        for (const [key, values] of Object.entries(reviewAuthority)) {
-            const available = authority[key as keyof typeof authority];
-
-            if (
-                values.some((value) => typeof value !== "string" || value.length === 0) ||
-                new Set(values).size !== values.length ||
-                values.some((value) => !available.includes(value))
-            ) {
-                throw new TypeError(
-                    `Review authority ceiling ${key} must be a unique subset of the host authority`,
-                );
-            }
-        }
-
-        review = Object.freeze({
-            profileAllowlist: Object.freeze(profileAllowlist),
-            authority: freezeJson(
-                reviewAuthority as unknown as JsonValue,
-            ) as unknown as Required<WorkflowAgentAuthorityFloor>,
-        });
-    }
-
     return Object.freeze({
         profiles: Object.freeze(profiles),
         byId,
         authority: freezeJson(
             authority as unknown as JsonValue,
         ) as unknown as Required<WorkflowAgentAuthorityFloor>,
-        ...(review === undefined ? {} : { review }),
         ...(config.buildEnv === undefined ? {} : { buildEnv: config.buildEnv }),
     });
 }

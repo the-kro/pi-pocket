@@ -360,13 +360,20 @@ const profile = {
         : {}),
     result: workflowRuntime.WORKFLOW_REVIEW_RESULT,
 };
+const agentConfig = {
+    profiles: [profile],
+    ...(hostAuthority === undefined ? {} : { authority: hostAuthority }),
+};
+const reviewConfig = { profileAllowlist: [profileId], authority };
 const runtime = workflowRuntime.createWorkflowAgentRuntime({
     harnessOptions: { models, registry },
-    agentConfig: {
-        profiles: [profile],
-        ...(hostAuthority === undefined ? {} : { authority: hostAuthority }),
-        review: { profileAllowlist: [profileId], authority },
-    },
+    agentConfig,
+    admissionPolicy: workflowRuntime.createWorkflowAgentReviewAdmissionPolicy({
+        models,
+        registry,
+        agentConfig,
+        reviewConfig,
+    }),
 });
 
 registry.install(runtime.extension);

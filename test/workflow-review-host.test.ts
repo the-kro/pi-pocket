@@ -11,6 +11,7 @@ import { createRegistry, defineExtension, defineTool } from "@earendil-works/pi-
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import {
     createReviewReviewerIdentity,
+    createWorkflowAgentReviewAdmissionPolicy,
     createWorkflowAgentRuntime,
     defineWorkflow,
     review,
@@ -171,13 +172,17 @@ test("public standalone host runs and recovers an offline Review consumer", asyn
         const registry = createRegistry();
 
         registry.install(reviewExtension);
+        const agentConfig = { authority, profiles: [reviewerProfile] };
+        const reviewConfig = { profileAllowlist: [reviewerProfile.id], authority };
         const runtime = createWorkflowAgentRuntime({
             harnessOptions: { models, registry },
-            agentConfig: {
-                authority,
-                profiles: [reviewerProfile],
-                review: { profileAllowlist: [reviewerProfile.id], authority },
-            },
+            agentConfig,
+            admissionPolicy: createWorkflowAgentReviewAdmissionPolicy({
+                models,
+                registry,
+                agentConfig,
+                reviewConfig,
+            }),
         });
 
         registry.install(runtime.extension);

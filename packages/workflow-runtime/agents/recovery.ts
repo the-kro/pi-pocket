@@ -14,12 +14,12 @@ import {
 import { canonicalInput } from "../core/identity.ts";
 import {
     type AgentThreadIdentity,
-    type WorkflowAgentReviewIdentity,
     hasWorkflowAgentProviderSessionIdPrefix,
     parseWorkflowAgentProviderSessionId,
     workflowAgentThreadKey,
 } from "./profile.ts";
 import { RUN_DOC } from "../core/index.ts";
+import { parseWorkflowAgentPolicyBinding } from "./admission-policy.ts";
 import {
     AGENT_RUNNER_TASK_NAME,
     AGENT_THREAD_DOC,
@@ -160,8 +160,22 @@ async function registerPersistedAgentConversations(
 
         for (const document of page.items) {
             const stored = await storage.document(document.id, "current", context);
-            const record = stored?.value as unknown as Partial<AgentThreadRecord> | undefined;
-            const conversationId = record?.conversationId;
+
+            if (stored?.version !== AGENT_THREAD_DOC.definition.version) {
+                throw new WorkflowAgentAdmissionError(
+                    `Agent thread document ${document.id} has unsupported durable agent thread document version ${String(stored?.version)}; recovery remains paused`,
+                );
+            }
+
+            const record = stored.value as unknown as Partial<AgentThreadRecord>;
+
+            if (record.schemaVersion !== 1) {
+                throw new WorkflowAgentAdmissionError(
+                    `Agent thread document ${document.id} has unsupported agent thread format ${String(record?.schemaVersion)}; recovery remains paused`,
+                );
+            }
+
+            const conversationId = record.conversationId;
 
             if (
                 typeof conversationId === "number" &&
@@ -213,8 +227,25 @@ async function registerPersistedAgentRunnerConversations(
                 continue;
             }
 
-            const input = task.input as { readonly conversationId?: unknown } | undefined;
-            const conversationId = input?.conversationId;
+            const input = task.input as Record<string, unknown> | undefined;
+
+            if (task.version !== 1 || input?.schemaVersion !== 1) {
+                throw new WorkflowAgentAdmissionError(
+                    `Agent runner Task ${task.id} has unsupported agent runner format ${String(task.version)}/${String(input?.schemaVersion)}; recovery remains paused`,
+                );
+            }
+
+            if (input.policyBinding !== undefined) {
+                try {
+                    parseWorkflowAgentPolicyBinding(input.policyBinding as JsonValue);
+                } catch {
+                    throw new WorkflowAgentAdmissionError(
+                        `Agent runner Task ${task.id} has an unsupported admission policy binding; recovery remains paused`,
+                    );
+                }
+            }
+
+            const conversationId = input.conversationId;
 
             if (
                 typeof conversationId !== "number" ||
@@ -321,6 +352,7 @@ export async function recoverAgentRunnerTasks(
 
     for (const task of candidates) {
         const input = task.input as Partial<AgentThreadIdentity> & {
+            readonly schemaVersion?: unknown;
             readonly conversationId?: unknown;
             readonly requestId?: unknown;
             readonly turnId?: unknown;
@@ -329,9 +361,7 @@ export async function recoverAgentRunnerTasks(
             readonly intentDigest?: unknown;
             readonly content?: unknown;
             readonly workflowTaskId?: unknown;
-            readonly purpose?: unknown;
-            readonly reviewerIdentity?: unknown;
-            readonly freshThread?: unknown;
+            readonly policyBinding?: unknown;
         };
 
         if (
@@ -380,7 +410,22 @@ export async function recoverAgentRunnerTasks(
             typeof input.requestId === "string" && input.requestId.length > 0
                 ? input.requestId
                 : undefined;
+        const parsedPolicyBinding = (() => {
+            if (input.policyBinding === undefined) {
+                return { valid: true as const, value: undefined };
+            }
+
+            try {
+                return {
+                    valid: true as const,
+                    value: parseWorkflowAgentPolicyBinding(input.policyBinding as JsonValue),
+                };
+            } catch {
+                return { valid: false as const, value: undefined };
+            }
+        })();
         const intentMatches =
+            parsedPolicyBinding.valid &&
             typeof input.turnId === "string" &&
             typeof input.intentCanonical === "string" &&
             typeof input.intentDigest === "string" &&
@@ -392,19 +437,13 @@ export async function recoverAgentRunnerTasks(
                 content: input.content as JsonValue,
                 intentCanonical: input.intentCanonical,
                 intentDigest: input.intentDigest,
-                ...(input.purpose === undefined ? {} : { purpose: input.purpose as "review" }),
-                ...(input.reviewerIdentity === undefined
+                ...(parsedPolicyBinding.value === undefined
                     ? {}
-                    : {
-                          reviewerIdentity:
-                              input.reviewerIdentity as unknown as WorkflowAgentReviewIdentity,
-                      }),
-                ...(input.freshThread === undefined
-                    ? {}
-                    : { freshThread: input.freshThread as boolean }),
+                    : { policyBinding: parsedPolicyBinding.value }),
             });
         const exactTurn =
             task.version === 1 &&
+            input.schemaVersion === 1 &&
             task.owner === existing.ownerTaskId &&
             input.workflowTaskId === existing.ownerTaskId &&
             intentMatches &&
@@ -420,9 +459,7 @@ export async function recoverAgentRunnerTasks(
             turn.requestId === requestId &&
             turn.intentCanonical === input.intentCanonical &&
             turn.intentDigest === input.intentDigest &&
-            turn.purpose === input.purpose &&
-            turn.freshThread === input.freshThread &&
-            persistedJsonMatches(turn.reviewerIdentity, input.reviewerIdentity);
+            persistedJsonMatches(turn.policyBinding, parsedPolicyBinding.value);
         const nativeConversationId =
             typeof existing.conversationId === "number" &&
             Number.isSafeInteger(existing.conversationId) &&

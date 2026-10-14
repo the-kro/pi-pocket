@@ -30,17 +30,15 @@ import {
     type ResolvedWorkflowAgentConfig,
     type EffectiveWorkflowAgentAuthority,
     type WorkflowAgentResultBinding,
-    type WorkflowAgentReviewIdentity,
     workflowAgentProviderSessionId,
     workflowAgentThreadKey,
 } from "./profile.ts";
 import {
-    type WorkflowAgentReviewProfileResolution,
-    resolveWorkflowAgentReviewProfile,
-    workflowAgentReviewIdentityMatches,
-    workflowAgentReviewResolutionMatches,
-    workflowAgentReviewThreadAdmissionMatches,
-} from "./review-policy.ts";
+    type WorkflowAgentAdmissionPolicy,
+    type WorkflowAgentPolicyBinding,
+    parseWorkflowAgentPolicyBinding,
+    validateWorkflowAgentAdmission,
+} from "./admission-policy.ts";
 import {
     type WorkflowAgentProfileSnapshot,
     workflowAgentProfileSnapshot,
@@ -67,12 +65,11 @@ export type WorkflowAgentTurnInput = {
     readonly sections?: readonly string[];
     readonly tools?: readonly string[];
     readonly capabilities?: readonly string[];
-    readonly purpose?: "review";
-    readonly reviewerIdentity?: WorkflowAgentReviewIdentity;
-    readonly freshThread?: boolean;
+    readonly policyBinding?: WorkflowAgentPolicyBinding;
 };
 
 type AgentRunnerInput = {
+    readonly schemaVersion: 1;
     readonly runId: string;
     readonly workflowTaskId: number;
     readonly threadKey: string;
@@ -84,9 +81,7 @@ type AgentRunnerInput = {
     readonly intentCanonical: string;
     readonly intentDigest: string;
     readonly content: UserInput;
-    readonly purpose?: "review";
-    readonly reviewerIdentity?: WorkflowAgentReviewIdentity;
-    readonly freshThread?: boolean;
+    readonly policyBinding?: WorkflowAgentPolicyBinding;
     readonly profileFingerprint: string;
     readonly modelFingerprint: string;
     readonly profileInput: JsonValue;
@@ -184,36 +179,6 @@ type Admission =
 const PROVIDER_SESSION_PREFIX = "pocket-workflow-agent-v1:";
 const TURN_REQUEST_PREFIX = "pocket-workflow-agent-turn-v1:";
 
-function parseReviewIdentity(value: JsonValue): WorkflowAgentReviewIdentity {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-        throw new TypeError("Review turn requires a resolved reviewer identity object");
-    }
-
-    const identity = value as Record<string, JsonValue>;
-    const expectedKeys = [
-        "profileId",
-        "profileFingerprint",
-        "modelFingerprint",
-        "authorityFingerprint",
-        "policyFingerprint",
-        "resultSchemaFingerprint",
-        "fingerprint",
-    ];
-    const stringKeys = expectedKeys.filter((key) => key !== "resultSchemaFingerprint");
-
-    if (
-        Object.keys(identity).length !== expectedKeys.length ||
-        expectedKeys.some((key) => !Object.hasOwn(identity, key)) ||
-        stringKeys.some((key) => typeof identity[key] !== "string" || identity[key].length === 0) ||
-        (identity.resultSchemaFingerprint !== null &&
-            typeof identity.resultSchemaFingerprint !== "string")
-    ) {
-        throw new TypeError("Review turn requires a complete resolved reviewer identity");
-    }
-
-    return copyJson(identity as unknown as JsonValue) as unknown as WorkflowAgentReviewIdentity;
-}
-
 function parseTurnInput(input: JsonValue): WorkflowAgentTurnInput {
     if (typeof input !== "object" || input === null || Array.isArray(input)) {
         throw new TypeError("Agent turn input must be an object");
@@ -240,16 +205,9 @@ function parseTurnInput(input: JsonValue): WorkflowAgentTurnInput {
                     "sections",
                     "tools",
                     "capabilities",
-                    "purpose",
-                    "reviewerIdentity",
-                    "freshThread",
+                    "policyBinding",
                 ].includes(key),
-        ) ||
-        (record.purpose !== undefined && record.purpose !== "review") ||
-        (record.purpose === "review" && record.reviewerIdentity === undefined) ||
-        (record.purpose !== "review" && record.reviewerIdentity !== undefined) ||
-        (record.freshThread !== undefined && typeof record.freshThread !== "boolean") ||
-        (record.freshThread !== undefined && record.purpose !== "review")
+        )
     ) {
         throw new TypeError(
             "Agent turn requires non-empty threadId, turnId, profile, and content fields",
@@ -271,11 +229,9 @@ function parseTurnInput(input: JsonValue): WorkflowAgentTurnInput {
         ...(record.capabilities === undefined
             ? {}
             : { capabilities: parseNameList(record.capabilities, "capabilities") }),
-        ...(record.purpose === undefined ? {} : { purpose: "review" as const }),
-        ...(record.reviewerIdentity === undefined
+        ...(record.policyBinding === undefined
             ? {}
-            : { reviewerIdentity: parseReviewIdentity(record.reviewerIdentity) }),
-        ...(record.freshThread === undefined ? {} : { freshThread: record.freshThread as boolean }),
+            : { policyBinding: parseWorkflowAgentPolicyBinding(record.policyBinding) }),
     };
 }
 
@@ -320,11 +276,9 @@ function turnIntent(input: WorkflowAgentTurnInput): {
         turnId: input.turnId,
         profile: input.profile,
         content: input.content as unknown as JsonValue,
-        ...(input.purpose === undefined ? {} : { purpose: input.purpose }),
-        ...(input.reviewerIdentity === undefined
+        ...(input.policyBinding === undefined
             ? {}
-            : { reviewerIdentity: input.reviewerIdentity as unknown as JsonValue }),
-        ...(input.freshThread === undefined ? {} : { freshThread: input.freshThread }),
+            : { policyBinding: input.policyBinding as unknown as JsonValue }),
     });
 
     return { canonical: frozen.canonical, digest: frozen.digest, value: frozen.input };
@@ -337,9 +291,7 @@ export function workflowAgentRunnerIntentMatches(input: {
     readonly content: JsonValue;
     readonly intentCanonical: string;
     readonly intentDigest: string;
-    readonly purpose?: "review";
-    readonly reviewerIdentity?: WorkflowAgentReviewIdentity;
-    readonly freshThread?: boolean;
+    readonly policyBinding?: WorkflowAgentPolicyBinding;
 }): boolean {
     try {
         const intent = turnIntent({
@@ -347,11 +299,7 @@ export function workflowAgentRunnerIntentMatches(input: {
             turnId: input.turnId,
             profile: input.profileId,
             content: input.content as unknown as UserInput,
-            ...(input.purpose === undefined ? {} : { purpose: input.purpose }),
-            ...(input.reviewerIdentity === undefined
-                ? {}
-                : { reviewerIdentity: input.reviewerIdentity }),
-            ...(input.freshThread === undefined ? {} : { freshThread: input.freshThread }),
+            ...(input.policyBinding === undefined ? {} : { policyBinding: input.policyBinding }),
         });
 
         return intent.canonical === input.intentCanonical && intent.digest === input.intentDigest;
@@ -464,7 +412,7 @@ async function reserveTurn(
     input: WorkflowAgentTurnInput,
     snapshot: WorkflowAgentProfileSnapshot,
     runnerTask: AgentRunnerTask,
-    assertReviewIdentityCurrent?: () => void,
+    admissionPolicy?: WorkflowAgentAdmissionPolicy,
     onConversationAdmitted?: (conversationId: ConversationId) => void,
 ): Promise<Admission> {
     const owner = await tx.task(binding.taskId);
@@ -477,24 +425,19 @@ async function reserveTurn(
     const intent = turnIntent(input);
     const thread = await tx.doc(AGENT_THREAD_DOC, key, key);
 
-    assertReviewIdentityCurrent?.();
-
-    if (
-        input.purpose === "review" &&
-        !workflowAgentReviewThreadAdmissionMatches(thread, {
+    validateWorkflowAgentAdmission(
+        admissionPolicy,
+        "reservation",
+        input.profile,
+        thread,
+        {
             turnId: input.turnId,
             intentCanonical: intent.canonical,
             intentDigest: intent.digest,
-            freshThread: input.freshThread,
-            reviewerIdentity: input.reviewerIdentity,
-        })
-    ) {
-        throw new WorkflowAgentAdmissionError(
-            input.freshThread === true
-                ? "Fresh-thread admission requires an uninitialized thread or exact replay of its first turn"
-                : "Review turns require fresh-thread admission or an admitted Review first turn",
-        );
-    }
+            ...(input.policyBinding === undefined ? {} : { policyBinding: input.policyBinding }),
+        },
+        snapshot,
+    );
 
     if (thread.status === "uninitialized") {
         const nativeConversation = await tx.createConversation({
@@ -547,7 +490,6 @@ async function reserveTurn(
         }
     } else {
         await validateStoredThread(tx, thread, identity, binding, snapshot);
-        assertReviewIdentityCurrent?.();
 
         await configure(tx, thread.conversationId as ConversationId, {
             model: {
@@ -650,16 +592,19 @@ async function reserveTurn(
         authorityFingerprint: snapshot.authorityFingerprint,
         authorityInput: copyJson(snapshot.authorityInput),
         effectiveAuthority: copyJson(snapshot.authority as unknown as JsonValue),
-        ...(input.purpose === undefined ? {} : { purpose: input.purpose }),
-        ...(input.reviewerIdentity === undefined
+        ...(input.policyBinding === undefined
             ? {}
-            : { reviewerIdentity: copyJson(input.reviewerIdentity as unknown as JsonValue) }),
-        ...(input.freshThread === undefined ? {} : { freshThread: input.freshThread }),
+            : {
+                  policyBinding: copyJson(
+                      input.policyBinding as unknown as JsonValue,
+                  ) as unknown as WorkflowAgentPolicyBinding,
+              }),
         requestId: requestId(key, input.turnId),
         ...(resultSchema === undefined ? {} : { resultSchema }),
         status: "reserved",
     };
     const runnerInput: AgentRunnerInput = {
+        schemaVersion: 1,
         runId: binding.runId,
         workflowTaskId: Number(binding.taskId),
         threadKey: key,
@@ -671,15 +616,13 @@ async function reserveTurn(
         intentCanonical: record.intentCanonical,
         intentDigest: record.intentDigest,
         content: copyJson(input.content as unknown as JsonValue) as UserInput,
-        ...(record.purpose === undefined ? {} : { purpose: record.purpose }),
-        ...(record.reviewerIdentity === undefined
+        ...(record.policyBinding === undefined
             ? {}
             : {
-                  reviewerIdentity: copyJson(
-                      record.reviewerIdentity,
-                  ) as unknown as WorkflowAgentReviewIdentity,
+                  policyBinding: copyJson(
+                      record.policyBinding as unknown as JsonValue,
+                  ) as unknown as WorkflowAgentPolicyBinding,
               }),
-        ...(record.freshThread === undefined ? {} : { freshThread: record.freshThread }),
         profileFingerprint: record.profileFingerprint,
         modelFingerprint: record.modelFingerprint,
         profileInput: copyJson(record.profileInput),
@@ -695,8 +638,6 @@ async function reserveTurn(
                   ) as AgentRunnerInput["resultSchema"],
               }),
     };
-
-    assertReviewIdentityCurrent?.();
 
     const runnerTaskId = await tx.createTask(runnerTask, runnerInput, {
         ownership: { kind: "task", taskId: binding.taskId },
@@ -716,7 +657,7 @@ export function createWorkflowAgentTurnBinder(options: {
     readonly models: Models;
     readonly config: ResolvedWorkflowAgentConfig;
     readonly registry: RegistryReader;
-    readonly resolveReviewProfile?: (profileId: string) => WorkflowAgentReviewProfileResolution;
+    readonly admissionPolicy?: WorkflowAgentAdmissionPolicy;
     readonly runnerTask: AgentRunnerTask;
     readonly onConversationAdmitted?: (conversationId: ConversationId) => void;
 }): WorkflowAgentTurnBinder {
@@ -739,45 +680,31 @@ export function createWorkflowAgentTurnBinder(options: {
                 );
             }
 
-            const snapshot =
-                input.purpose === "review"
+            const policyProfile =
+                input.policyBinding === undefined
                     ? undefined
-                    : workflowAgentProfileSnapshot(
-                          options.models,
-                          options.config,
-                          profile,
-                          input,
-                          options.registry,
-                      );
+                    : options.admissionPolicy?.resolveProfile?.(profile.id);
+            const snapshot =
+                policyProfile?.snapshot ??
+                workflowAgentProfileSnapshot(
+                    options.models,
+                    options.config,
+                    profile,
+                    input,
+                    options.registry,
+                );
             const identity: AgentThreadIdentity = {
                 runId: binding.runId,
                 threadId: input.threadId,
                 profileId: profile.id,
             };
 
-            const requireCurrentReviewIdentity = () => {
-                const resolved = options.resolveReviewProfile?.(profile.id);
-
-                if (
-                    resolved === undefined ||
-                    !workflowAgentReviewIdentityMatches(resolved, input.reviewerIdentity)
-                ) {
-                    throw new WorkflowAgentAdmissionError(
-                        "Resolved Review identity changed before turn reservation",
-                    );
-                }
-
-                return resolved;
-            };
-
-            const assertReviewIdentityCurrent =
-                input.purpose === "review" ? () => void requireCurrentReviewIdentity() : undefined;
             const admission = await binding.commit((tx) => {
-                let currentSnapshot = snapshot;
-
-                if (input.purpose === "review") {
-                    currentSnapshot = requireCurrentReviewIdentity().snapshot;
-                }
+                const currentSnapshot =
+                    input.policyBinding === undefined
+                        ? snapshot
+                        : (options.admissionPolicy?.resolveProfile?.(profile.id)?.snapshot ??
+                          snapshot);
 
                 if (currentSnapshot === undefined) {
                     throw new WorkflowAgentAdmissionError("Agent profile snapshot is unavailable");
@@ -790,7 +717,7 @@ export function createWorkflowAgentTurnBinder(options: {
                     input,
                     currentSnapshot,
                     options.runnerTask,
-                    assertReviewIdentityCurrent,
+                    options.admissionPolicy,
                     options.onConversationAdmitted,
                 );
             });
@@ -855,15 +782,13 @@ export function createWorkflowAgentTurnBinder(options: {
 
         return Object.assign(handler, {
             resolveProfile: (profileId: string): JsonValue => {
-                const resolved = options.resolveReviewProfile?.(profileId);
+                const policyProfile = options.admissionPolicy?.resolveProfile?.(profileId);
 
-                if (resolved === undefined) {
-                    throw new WorkflowAgentAdmissionError(
-                        "Agent profile resolution is not configured",
-                    );
+                if (policyProfile !== undefined) {
+                    return copyJson(policyProfile.descriptor);
                 }
 
-                return resolved.descriptor as unknown as JsonValue;
+                throw new WorkflowAgentAdmissionError("Agent profile resolution is not configured");
             },
         });
     };
@@ -889,7 +814,9 @@ function validateRunnerThread(
     ownerTaskId: TaskId,
 ): asserts thread is AgentThreadRecord {
     if (
+        input.schemaVersion !== 1 ||
         thread === undefined ||
+        thread.schemaVersion !== 1 ||
         thread.status !== "ready" ||
         thread.runId !== input.runId ||
         thread.threadId !== input.threadId ||
@@ -911,11 +838,9 @@ function validateRunnerThread(
                 turn.intentCanonical === input.intentCanonical &&
                 turn.intentDigest === input.intentDigest &&
                 turn.authorityFingerprint === input.authorityFingerprint &&
-                turn.purpose === input.purpose &&
-                turn.freshThread === input.freshThread &&
                 sameJson(
-                    turn.reviewerIdentity,
-                    input.reviewerIdentity as unknown as JsonValue | undefined,
+                    turn.policyBinding as unknown as JsonValue | undefined,
+                    input.policyBinding as unknown as JsonValue | undefined,
                 ) &&
                 sameJson(turn.authorityInput, input.authorityInput) &&
                 sameJson(turn.effectiveAuthority, input.effectiveAuthority) &&
@@ -1096,6 +1021,7 @@ async function runAgentTurn(
     models: Models,
     config: ResolvedWorkflowAgentConfig,
     registry: RegistryReader,
+    admissionPolicy?: WorkflowAgentAdmissionPolicy,
 ): Promise<void> {
     const input = task.input;
 
@@ -1107,11 +1033,7 @@ async function runAgentTurn(
             content: input.content as unknown as JsonValue,
             intentCanonical: input.intentCanonical,
             intentDigest: input.intentDigest,
-            ...(input.purpose === undefined ? {} : { purpose: input.purpose }),
-            ...(input.reviewerIdentity === undefined
-                ? {}
-                : { reviewerIdentity: input.reviewerIdentity }),
-            ...(input.freshThread === undefined ? {} : { freshThread: input.freshThread }),
+            ...(input.policyBinding === undefined ? {} : { policyBinding: input.policyBinding }),
         })
     ) {
         throw new WorkflowAgentAdmissionError(
@@ -1126,7 +1048,11 @@ async function runAgentTurn(
     }
 
     const effective = input.effectiveAuthority as unknown as EffectiveWorkflowAgentAuthority;
-    const snapshot = workflowAgentProfileSnapshot(
+    const resolvedPolicyProfile =
+        input.policyBinding === undefined
+            ? undefined
+            : admissionPolicy?.resolveProfile?.(input.profileId);
+    const genericSnapshot = workflowAgentProfileSnapshot(
         models,
         config,
         currentProfile,
@@ -1138,23 +1064,9 @@ async function runAgentTurn(
         },
         registry,
     );
-    let reviewIdentityIsCurrent =
-        input.purpose === undefined &&
-        input.reviewerIdentity === undefined &&
-        input.freshThread === undefined;
-
-    if (input.purpose === "review") {
-        const review = resolveWorkflowAgentReviewProfile(models, config, input.profileId, registry);
-
-        reviewIdentityIsCurrent = workflowAgentReviewResolutionMatches(
-            review,
-            input.reviewerIdentity,
-            input.effectiveAuthority,
-        );
-    }
+    const snapshot = resolvedPolicyProfile?.snapshot ?? genericSnapshot;
 
     if (
-        !reviewIdentityIsCurrent ||
         snapshot.profileFingerprint !== input.profileFingerprint ||
         snapshot.modelFingerprint !== input.modelFingerprint ||
         snapshot.authorityFingerprint !== input.authorityFingerprint ||
@@ -1191,6 +1103,19 @@ async function runAgentTurn(
     const nativeThread = await runtime.snapshot(AGENT_THREAD_DOC, input.threadKey, context);
 
     validateRunnerThread(nativeThread, input, task.id);
+    validateWorkflowAgentAdmission(
+        admissionPolicy,
+        "dispatch",
+        input.profileId,
+        nativeThread,
+        {
+            turnId: input.turnId,
+            intentCanonical: input.intentCanonical,
+            intentDigest: input.intentDigest,
+            ...(input.policyBinding === undefined ? {} : { policyBinding: input.policyBinding }),
+        },
+        snapshot,
+    );
 
     if (
         nativeThread.profileFingerprint !== snapshot.profileFingerprint ||
@@ -1417,6 +1342,7 @@ export function createWorkflowAgentRunnerTask(
     models: Models,
     config: ResolvedWorkflowAgentConfig,
     registry: RegistryReader,
+    admissionPolicy?: WorkflowAgentAdmissionPolicy,
 ) {
     return defineTask<AgentRunnerInput, AgentRunnerCheckpoint, JsonValue>({
         name: AGENT_RUNNER_TASK_NAME,
@@ -1425,7 +1351,15 @@ export function createWorkflowAgentRunnerTask(
         phases: {
             run: async (task, runtime, context) => {
                 try {
-                    await runAgentTurn(task, runtime, context, models, config, registry);
+                    await runAgentTurn(
+                        task,
+                        runtime,
+                        context,
+                        models,
+                        config,
+                        registry,
+                        admissionPolicy,
+                    );
                 } catch (error) {
                     try {
                         await classifyRunnerFailure(runtime, task.input, task.id, context, config);

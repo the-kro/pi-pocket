@@ -1,12 +1,12 @@
 /** Run one revision-bound, schema-settled Review pass through the workflow agent adapter. */
 import { createHash } from "node:crypto";
 import { copyJson, type JsonValue } from "@earendil-works/chord";
-import type {
-    WorkflowAgentResultBinding,
-    WorkflowAgentReviewIdentity,
-    WorkflowAgentReviewProfileDescriptor,
-} from "../agents/profile.ts";
+import type { WorkflowAgentResultBinding } from "../agents/profile.ts";
 import { workflowAgentResultSchemaFingerprint } from "../agents/profile.ts";
+import {
+    createWorkflowAgentReviewPolicyBinding,
+    type WorkflowAgentReviewProfileDescriptor,
+} from "./agent-policy.ts";
 import {
     ReviewRequestConflict,
     assertReviewBindingUnchanged,
@@ -260,9 +260,10 @@ export async function review<I extends JsonValue>(
                     turnId: stableRequest.turnId,
                     profile: stableRequest.reviewerProfile,
                     content: requestContent,
-                    purpose: "review",
-                    reviewerIdentity: resolvedProfile.identity as WorkflowAgentReviewIdentity,
-                    freshThread: stableRequest.turnId === stableGate.firstTurnId,
+                    policyBinding: createWorkflowAgentReviewPolicyBinding(
+                        resolvedProfile.identity,
+                        stableRequest.turnId === stableGate.firstTurnId,
+                    ),
                 });
 
                 assertActive(context.signal);

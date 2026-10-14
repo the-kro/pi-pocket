@@ -1,6 +1,12 @@
 import type { JsonValue } from "@earendil-works/chord";
 import { defineDocFamily } from "@earendil-works/pi-durable";
 
+export type WorkflowAgentPolicyBinding = {
+    readonly policyId: string;
+    readonly policyVersion: string;
+    readonly input: JsonValue;
+};
+
 export type AgentThreadStatus = "uninitialized" | "ready" | "unknown" | "closed";
 export type AgentTurnStatus = "reserved" | "submitted" | "completed" | "not-completed" | "unknown";
 
@@ -40,9 +46,7 @@ export type AgentTurnRecord = {
     readonly authorityFingerprint: string;
     readonly authorityInput: JsonValue;
     readonly effectiveAuthority: JsonValue;
-    readonly purpose?: "review";
-    readonly reviewerIdentity?: JsonValue;
-    readonly freshThread?: boolean;
+    readonly policyBinding?: WorkflowAgentPolicyBinding;
     readonly requestId: string;
     readonly resultSchema?: AgentTurnResultSchema;
     status: AgentTurnStatus;
